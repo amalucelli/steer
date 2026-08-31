@@ -123,6 +123,12 @@ and is fine, as is `tail -f`, and so is a file outside this workspace."""
 #
 # Matching `-` and not `-c` is the whole precision of this rule. `-c` is how a
 # short computation gets written and is overwhelmingly legitimate.
+#
+# Two blocks because a program can arrive on stdin two ways. `python3 - <<'PY'`
+# names stdin explicitly; bare `python3 <<'PY'` reads it with no argument at
+# all, and since the heredoc operator is stripped during lexing that segment
+# carries an empty `args`. `none_glob` passes vacuously on an empty array,
+# which is how "took no arguments" is expressed here.
 [[rules]]
 name = "edit-over-python"
 description = "Inline Python programs fed to stdin belong to the Edit and Write tools."
@@ -132,6 +138,12 @@ tool = "Bash"
 any = "parsed.segments"
 head = { any_of = ["python", "python3"] }
 "args.0" = { any_of = ["-"] }
+pipeline_start = { is = true }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["python", "python3"] }
+args = { none_glob = ["*"] }
 pipeline_start = { is = true }
 
 [rules.action]

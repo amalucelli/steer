@@ -58,6 +58,10 @@ pub struct Segment {
     pub wrappers: Vec<String>,
     pub head_span: Option<Span>,
     pub arg_spans: Vec<Option<Span>>,
+    /// Set on every segment of a command whose parse needed recovery, which
+    /// today means an unclosed heredoc. Where a command ends and body text
+    /// begins is then a guess, so nothing may be rewritten from it.
+    pub recovered: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,15 +87,22 @@ enum Tok {
 
 pub fn lex(command: &str) -> Vec<Segment> {
     let mut out = Vec::new();
-    lex_into(command, 0, &mut out);
+    // Recovery anywhere, including inside a nested script, taints the whole
+    // parse: the boundary it got wrong may not be the one a rule matched on.
+    if lex_into(command, 0, &mut out) {
+        for segment in &mut out {
+            segment.recovered = true;
+        }
+    }
     out
 }
 
-fn lex_into(src: &str, depth: u32, out: &mut Vec<Segment>) {
+/// Returns whether the parse needed recovery from an unclosed heredoc.
+fn lex_into(src: &str, depth: u32, out: &mut Vec<Segment>) -> bool {
     if depth > MAX_DEPTH {
-        return;
+        return false;
     }
-    let toks = tokenize(src, depth == 0);
+    let (toks, mut recovered) = tokenize(src, depth == 0);
     for statement in toks.split(|t| matches!(t, Tok::Op(Op::Sep))) {
         for (stage, tokens) in statement
             .split(|t| matches!(t, Tok::Op(Op::Pipe)))
@@ -101,11 +112,12 @@ fn lex_into(src: &str, depth: u32, out: &mut Vec<Segment>) {
             peel(&words, depth, stage == 0, out);
             for word in &words {
                 for sub in &word.subs {
-                    lex_into(sub, depth + 1, out);
+                    recovered |= lex_into(sub, depth + 1, out);
                 }
             }
         }
     }
+    recovered
 }
 
 /// Drops redirection targets so `2>/dev/null` never reaches a rule as an
@@ -129,10 +141,12 @@ fn collect_words(tokens: &[Tok]) -> Vec<Word> {
     words
 }
 
-fn tokenize(src: &str, keep_spans: bool) -> Vec<Tok> {
+/// Returns the tokens and whether an unclosed heredoc forced recovery.
+fn tokenize(src: &str, keep_spans: bool) -> (Vec<Tok>, bool) {
     let bytes = src.as_bytes();
     let mut toks = Vec::new();
     let mut i = 0;
+    let mut recovered = false;
     // Heredocs opened on the current line, in the order their bodies arrive.
     let mut pending: Vec<(String, bool)> = Vec::new();
 
@@ -146,7 +160,9 @@ fn tokenize(src: &str, keep_spans: bool) -> Vec<Tok> {
             toks.push(Tok::Op(Op::Sep));
             i += 1;
             if !pending.is_empty() {
-                i = skip_heredoc_bodies(src, i, &pending);
+                let (next, closed) = skip_heredoc_bodies(src, i, &pending);
+                i = next;
+                recovered |= !closed;
                 pending.clear();
             }
             continue;
@@ -188,7 +204,7 @@ fn tokenize(src: &str, keep_spans: bool) -> Vec<Tok> {
             }));
         }
     }
-    toks
+    (toks, recovered)
 }
 
 /// A heredoc operator together with its delimiter word, returning how many
@@ -222,17 +238,26 @@ fn heredoc_at(src: &str, i: usize) -> Option<(usize, String, bool)> {
     Some((end - i, word.text, strip_tabs))
 }
 
-/// Consumes heredoc bodies whole, ending just past the terminator line of the
-/// last one.
+/// Consumes heredoc bodies whole, returning where to resume lexing and whether
+/// every body was closed.
 ///
-/// The body is data — a script being written, a SQL blob, a commit message —
-/// and must produce no segments at all. Lexing it as commands let a rewrite
+/// A closed body is data — a script being written, a SQL blob, a commit message
+/// — and must produce no segments at all. Lexing it as commands let a rewrite
 /// splice into the contents of a file rather than into a command, which changes
 /// what the user wrote with nothing in the transcript to show it.
-fn skip_heredoc_bodies(src: &str, from: usize, pending: &[(String, bool)]) -> usize {
+///
+/// An unclosed body rewinds instead, so the text after it is lexed. Consuming
+/// to end of input would mean one stray character on a terminator line hides
+/// every following command from every rule, and a tool whose whole job is
+/// inspecting commands must not resolve a parse ambiguity by seeing nothing.
+/// The command is broken either way — bash will not run it to completion — so
+/// a spurious segment from body text costs nothing real, and it is visible.
+fn skip_heredoc_bodies(src: &str, from: usize, pending: &[(String, bool)]) -> (usize, bool) {
     let b = src.as_bytes();
     let mut i = from;
     for (delimiter, strip_tabs) in pending {
+        let body_start = i;
+        let mut closed = false;
         while i < b.len() {
             let mut end = i;
             while end < b.len() && b[end] != b'\n' {
@@ -244,13 +269,19 @@ fn skip_heredoc_bodies(src: &str, from: usize, pending: &[(String, bool)]) -> us
             } else {
                 line
             };
+            // CRLF is an ordinary line ending, not exotic input: it arrives
+            // whenever a command is pasted from a Windows-authored source.
             i = (end + 1).min(b.len());
-            if line == delimiter {
+            if line.trim_end_matches('\r') == delimiter {
+                closed = true;
                 break;
             }
         }
+        if !closed {
+            return (body_start, false);
+        }
     }
-    i
+    (i, true)
 }
 
 /// A leading file-descriptor number glued to `<` or `>`, or `&>`.
@@ -550,6 +581,7 @@ fn peel(words: &[Word], depth: u32, pipeline_start: bool, out: &mut Vec<Segment>
         wrappers,
         head_span: head.span,
         arg_spans: rest.iter().map(|w| w.span).collect(),
+        recovered: false,
     });
 }
 
@@ -662,8 +694,25 @@ mod tests {
             heads("cat <<A <<B\nrm -rf a\nA\nrm -rf b\nB\nrm -rf real"),
             ["cat", "rm"]
         );
-        // An unterminated body runs to the end rather than leaking commands.
-        assert_eq!(heads("cat <<EOF\nrm -rf build\n"), ["cat"]);
+    }
+
+    // Appending a character to a terminator must not reduce what steer can
+    // see. Swallowing to end of input on a near-miss meant one stray byte hid
+    // every following command from every rule.
+    #[test]
+    fn a_terminator_near_miss_does_not_blind_the_lexer() {
+        // A carriage return is trimmed: CRLF terminates like LF.
+        assert_eq!(heads("cat <<'PY'\nx\nPY\r\nrm -rf build"), ["cat", "rm"]);
+        assert_eq!(
+            heads("cat <<'PY'\r\nx\r\nPY\r\nrm -rf build"),
+            ["cat", "rm"]
+        );
+        // A trailing space does not terminate, in bash or here. The heredoc is
+        // unclosed, so the remainder is lexed rather than discarded.
+        assert!(heads("cat <<'PY'\nx\nPY \nrm -rf build").contains(&"rm".to_string()));
+        // No terminator at all: still lexed, still no panic.
+        assert!(heads("cat <<EOF\nrm -rf build\n").contains(&"rm".to_string()));
+        assert!(heads("cat <<EOF").contains(&"cat".to_string()));
     }
 
     #[test]

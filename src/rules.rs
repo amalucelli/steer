@@ -499,6 +499,19 @@ pub fn evaluate(
                     ));
                     continue;
                 }
+                // An unclosed heredoc leaves steer guessing where a command
+                // ends and body text begins. Bash still runs such a line — it
+                // warns and treats EOF as the delimiter — so a rewrite aimed at
+                // a misread body would be written into whatever file the
+                // heredoc feeds. Deny and context are safe here because they
+                // change no bytes; only rewriting is.
+                if segments.iter().any(|s| s.recovered) {
+                    skipped.push((
+                        rule.spec.name.clone(),
+                        "the command did not parse cleanly (unclosed heredoc)".into(),
+                    ));
+                    continue;
+                }
                 // A rule that matches but cannot be spliced has not fired, and
                 // must not contribute its reason to the message either.
                 let hits = rule.matching_segments(&doc);

@@ -117,6 +117,10 @@ fn dispatch(subcommand: &str, args: &[String]) -> Result<i32> {
         "check" => check(args),
         "validate" => validate(),
         "init" => init(),
+        "-v" | "--version" => {
+            println!("steer {}", env!("CARGO_PKG_VERSION"));
+            Ok(0)
+        }
         _ => Ok(usage()),
     }
 }
@@ -128,7 +132,8 @@ fn usage() -> i32 {
          hook --event PreToolUse|PostToolUse   read a hook payload on stdin, decide on stdout\n\
          check '<command>'                     dry-run a Bash command through the rules\n\
          validate                              report problems in every config source\n\
-         init                                  write a starter global config"
+         init                                  write a starter global config\n\
+         -v, --version                         print the version"
     );
     2
 }

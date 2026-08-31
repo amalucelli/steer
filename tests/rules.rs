@@ -306,6 +306,12 @@ fn inline_python_programs_are_denied_and_computations_are_not() {
     let deny: &[&str] = &[
         "python3 - <<'PY'\nimport pathlib\npathlib.Path('x').write_text('y')\nPY\n",
         "python - <<EOF\nprint(1)\nEOF\n",
+        // Bare `python3` fed by a heredoc reads its program from stdin with no
+        // argument at all, so there is no `args.0` to match on.
+        "python3 <<'PY'\nopen(p, 'w').write(s)\nPY\n",
+        "python <<'EOF'\nprint(1)\nEOF\n",
+        // A REPL an agent has no use for, blocked as a side effect and accepted.
+        "python3",
     ];
     let allow: &[&str] = &[
         // A filter being fed data, not a program editing files. The producer is
@@ -728,6 +734,97 @@ fn a_heredoc_body_is_never_matched_or_rewritten() {
         value.pointer("/hookSpecificOutput/updatedInput/command"),
         Some(&serde_json::json!("cat <<EOF\nx\nEOF\ntrash build"))
     );
+}
+
+// The guarantee is not about one line ending: appending any character to a
+// terminator must not reduce what steer can see. Swallowing to end of input on
+// a near-miss made every following command invisible to every rule, so one
+// stray byte disabled enforcement for the rest of the call.
+#[test]
+fn a_terminator_near_miss_never_hides_what_follows() {
+    let sandbox = Sandbox::new("heredocblind");
+    sandbox.stub_binary("trash");
+
+    let sed = "sed -n '1,5p' f.txt";
+    for terminator in ["PY\n", "PY\r\n", "PY \n", "PY\t\n", "PY;\n"] {
+        let command = format!("cat <<'PY'\nx\n{terminator}{sed}");
+        assert!(
+            is_denied(&decision(&sandbox, &command)),
+            "terminator {terminator:?} hid the command after it"
+        );
+    }
+
+    // A closed body is still data, and the rewrite after it still lands on the
+    // command rather than on the contents.
+    let value = decision(&sandbox, "cat <<'PY'\nrm -rf inside\nPY\nrm -rf build");
+    assert_eq!(
+        value.pointer("/hookSpecificOutput/updatedInput/command"),
+        Some(&serde_json::json!(
+            "cat <<'PY'\nrm -rf inside\nPY\ntrash build"
+        )),
+        "the body must survive byte for byte"
+    );
+
+    // An unterminated heredoc leaves the remainder visible rather than blind,
+    // and must not panic.
+    decision(&sandbox, "cat <<'PY'\nrm -rf build\n");
+    decision(&sandbox, "cat <<'PY'");
+}
+
+// Bash runs an unterminated heredoc rather than rejecting it: it warns, treats
+// EOF as the delimiter, and writes the body. So a rewrite aimed at body text
+// steer misread as a command would land in the file the heredoc feeds — the
+// same silent corruption the body skip was added to prevent, arriving through
+// the recovery path. Deny and context still fire; they change no bytes.
+#[test]
+fn an_unclosed_heredoc_suppresses_rewrites_but_not_denies() {
+    let sandbox = Sandbox::new("recovered");
+    sandbox.stub_binary("trash");
+
+    // Closed: the rewrite lands on the trailing command, body untouched.
+    let value = decision(
+        &sandbox,
+        "cat > out.sh <<'PY'\nrm -rf build\nPY\nrm -rf dist",
+    );
+    assert_eq!(
+        value.pointer("/hookSpecificOutput/updatedInput/command"),
+        Some(&serde_json::json!(
+            "cat > out.sh <<'PY'\nrm -rf build\nPY\ntrash dist"
+        ))
+    );
+
+    // Unclosed: the body's `rm` is not a command, so nothing may be rewritten.
+    let value = decision(&sandbox, "cat > out.sh <<'PY'\nrm -rf build\n");
+    assert!(
+        value.pointer("/hookSpecificOutput/updatedInput").is_none(),
+        "rewrote a misread heredoc body: {value}"
+    );
+
+    // A deny on recovered text is still correct — it blocks and mutates
+    // nothing, which is why lexing the remainder is worth doing at all.
+    assert!(is_denied(&decision(
+        &sandbox,
+        "cat <<'PY'\nx\nPY \nsed -n '1,5p' f.txt"
+    )));
+
+    // A carriage return still closes the heredoc, so this parse is clean and
+    // the rewrite applies as normal.
+    let value = decision(&sandbox, "cat <<'PY'\nx\nPY\r\nrm -rf build");
+    assert_eq!(
+        value.pointer("/hookSpecificOutput/updatedInput/command"),
+        Some(&serde_json::json!("cat <<'PY'\nx\nPY\r\ntrash build"))
+    );
+}
+
+// `steer check` names the hold-back, so a suppressed rewrite is explainable
+// rather than looking like the rule simply failed to match.
+#[test]
+fn check_reports_a_rewrite_held_back_by_a_dirty_parse() {
+    let sandbox = Sandbox::new("checkrecovered");
+    sandbox.stub_binary("trash");
+    let (out, _) = cli(&sandbox, &["check", "cat <<'PY'\nrm -rf build\n"]);
+    assert!(out.contains("trash-over-rm"), "{out}");
+    assert!(out.contains("did not parse cleanly"), "{out}");
 }
 
 // edit-over-python fires on the invocation, which is outside the body it now
