@@ -20,6 +20,80 @@ action   rewrite
 rewrite  cd build && trash dist
 ```
 
+## Install
+
+```sh
+cargo install --path . --root ~/.local
+```
+
+Then register it in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "hooks": [{ "type": "command", "command": "steer hook --event PreToolUse" }] }
+    ]
+  }
+}
+```
+
+No config file is needed. The built-in rules are compiled into the binary and active on install.
+
+Register `PostToolUse` the same way once you have a `context` rule for it. None of the built-ins
+are, so adding it before then spends a process launch on every tool result and changes nothing.
+
+## Config
+
+Rules come from three places, each stacking on the one before:
+
+1. **Built-ins**, compiled into the binary and active with no config file at all.
+2. **`~/.config/steer/config.toml`** — your base, the one to keep in dotfiles. Honors
+   `$XDG_CONFIG_HOME`. `steer init` writes a commented starter here.
+3. **`.steer.toml` in the repo**, found by walking up from the session's working directory —
+   whatever this one project needs.
+
+A later source replaces an earlier rule of the same name, and `disable` switches one off wherever
+it came from:
+
+```toml
+# .steer.toml — no fff index in this repo, but psql reaches a live database
+disable = ["fff-over-grep"]
+
+[[rules]]
+name = "no-prod-psql"
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["psql"] }
+
+[rules.action]
+kind = "deny"
+message = "Use the read replica: psql -h replica.internal."
+```
+
+What a repo file cannot do is quietly soften a rule it does not name. Every matching rule is
+evaluated and the strongest action wins, so putting a `context` rule beside an inherited `deny`
+still denies. Switching one off takes `disable`, by name, in the open.
+
+`steer validate` reports unknown fields, bad globs and regexes, duplicate rule names, and a
+`disable` naming a rule nothing defines — with file and line.
+
+## Commands
+
+```
+steer hook --event PreToolUse|PostToolUse   read a hook payload on stdin, decide on stdout
+steer check '<command>'                     dry-run a Bash command through the rules
+steer validate                              report problems in every config source
+steer init                                  write a starter global config
+```
+
+`steer check` exits 1 when the command would be denied, so it drops into a script.
+
+`PostToolUse` accepts only `context` rules in v0.1. Denying or rewriting a call that already ran
+means nothing, and what else belongs there needs its own design pass.
+
 ## How it works
 
 A tool call arrives as JSON on stdin: a tool name and that tool's input. Four stages turn it into a
@@ -179,48 +253,6 @@ unfollowable: a search after a pipe (`gh pr list | grep foo`) filters output tha
 a search that lands outside the workspace, or under `node_modules`, is not something the fff tools
 can answer; and a `find` carrying an action primary (`-delete`, `-exec`) traverses in order to act.
 
-## Install
-
-```sh
-cargo install --path . --root ~/.local
-```
-
-Then register it in `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      { "hooks": [{ "type": "command", "command": "steer hook --event PreToolUse" }] }
-    ]
-  }
-}
-```
-
-No config file is needed. The built-in rules are compiled into the binary and active on install.
-
-Register `PostToolUse` the same way once you have a `context` rule for it. None of the built-ins
-are, so adding it before then spends a process launch on every tool result and changes nothing.
-
-## Config
-
-Two files stack on top of the built-ins:
-
-- `~/.config/steer/config.toml` (or `$XDG_CONFIG_HOME/steer/config.toml`) — the base, managed from
-  dotfiles.
-- `.steer.toml` in the repo, found by walking up from the session's working directory — appends
-  rules and disables inherited ones.
-
-Later sources replace an earlier rule of the same name. `disable` switches one off wherever it came
-from:
-
-```toml
-disable = ["fff-over-grep"]
-```
-
-`steer init` writes a commented starter file. `steer validate` reports unknown fields, bad globs and
-regexes, duplicate rule names, and a `disable` naming a rule nothing defines — with file and line.
-
 ## Fail open
 
 Nothing steer does may block a call it did not mean to block. A hook that hard failed would take
@@ -238,20 +270,6 @@ Every deny, rewrite, and context injection appends a JSON line to
 `~/.local/state/steer/steer.jsonl` (or `$XDG_STATE_HOME/steer/steer.jsonl`) with the rule names,
 outcome, tool input, agent type, session, and working directory. Allowed calls are not logged. A
 failed write is ignored — losing a log line is not a reason to interfere with a tool call.
-
-## Commands
-
-```
-steer hook --event PreToolUse|PostToolUse   read a hook payload on stdin, decide on stdout
-steer check '<command>'                     dry-run a Bash command through the rules
-steer validate                              report problems in every config source
-steer init                                  write a starter global config
-```
-
-`steer check` exits 1 when the command would be denied, so it drops into a script.
-
-`PostToolUse` accepts only `context` rules in v0.1. Denying or rewriting a call that already ran
-means nothing, and what else belongs there needs its own design pass.
 
 ## License
 
