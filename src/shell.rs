@@ -133,6 +133,8 @@ fn tokenize(src: &str, keep_spans: bool) -> Vec<Tok> {
     let bytes = src.as_bytes();
     let mut toks = Vec::new();
     let mut i = 0;
+    // Heredocs opened on the current line, in the order their bodies arrive.
+    let mut pending: Vec<(String, bool)> = Vec::new();
 
     while i < bytes.len() {
         let c = bytes[i];
@@ -143,12 +145,23 @@ fn tokenize(src: &str, keep_spans: bool) -> Vec<Tok> {
         if c == b'\n' {
             toks.push(Tok::Op(Op::Sep));
             i += 1;
+            if !pending.is_empty() {
+                i = skip_heredoc_bodies(src, i, &pending);
+                pending.clear();
+            }
             continue;
         }
         if c == b'#' {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
+            continue;
+        }
+        // Both the operator and its delimiter are consumed here, so no token is
+        // emitted: there is no target word left for a redirect to swallow.
+        if let Some((len, delimiter, strip_tabs)) = heredoc_at(src, i) {
+            pending.push((delimiter, strip_tabs));
+            i += len;
             continue;
         }
         if let Some(len) = redirect_len(bytes, i) {
@@ -176,6 +189,68 @@ fn tokenize(src: &str, keep_spans: bool) -> Vec<Tok> {
         }
     }
     toks
+}
+
+/// A heredoc operator together with its delimiter word, returning how many
+/// bytes the pair occupies, the delimiter, and whether `<<-` asked for leading
+/// tabs to be stripped from the terminator.
+///
+/// `<<<` is a herestring — one word, not a body — and is deliberately not
+/// matched here. Quoting the delimiter changes expansion inside the body but
+/// not where the body ends, so it does not change the skip.
+fn heredoc_at(src: &str, i: usize) -> Option<(usize, String, bool)> {
+    let b = src.as_bytes();
+    let mut j = i;
+    while j < b.len() && b[j].is_ascii_digit() {
+        j += 1;
+    }
+    if b.get(j) != Some(&b'<') || b.get(j + 1) != Some(&b'<') || b.get(j + 2) == Some(&b'<') {
+        return None;
+    }
+    let mut k = j + 2;
+    let strip_tabs = b.get(k) == Some(&b'-');
+    if strip_tabs {
+        k += 1;
+    }
+    while k < b.len() && matches!(b[k], b' ' | b'\t') {
+        k += 1;
+    }
+    let (word, end) = scan_word(src, k);
+    if word.text.is_empty() {
+        return None;
+    }
+    Some((end - i, word.text, strip_tabs))
+}
+
+/// Consumes heredoc bodies whole, ending just past the terminator line of the
+/// last one.
+///
+/// The body is data — a script being written, a SQL blob, a commit message —
+/// and must produce no segments at all. Lexing it as commands let a rewrite
+/// splice into the contents of a file rather than into a command, which changes
+/// what the user wrote with nothing in the transcript to show it.
+fn skip_heredoc_bodies(src: &str, from: usize, pending: &[(String, bool)]) -> usize {
+    let b = src.as_bytes();
+    let mut i = from;
+    for (delimiter, strip_tabs) in pending {
+        while i < b.len() {
+            let mut end = i;
+            while end < b.len() && b[end] != b'\n' {
+                end += 1;
+            }
+            let line = &src[i..end];
+            let line = if *strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            i = (end + 1).min(b.len());
+            if line == delimiter {
+                break;
+            }
+        }
+    }
+    i
 }
 
 /// A leading file-descriptor number glued to `<` or `>`, or `&>`.
@@ -568,6 +643,46 @@ mod tests {
     #[test]
     fn combined_shell_flags_recurse() {
         assert_eq!(heads("bash -lc 'rg foo src'"), ["rg"]);
+    }
+
+    #[test]
+    fn heredoc_bodies_are_data_not_commands() {
+        assert_eq!(
+            heads("cat > clean.sh <<'EOF'\nrm -rf build\nEOF\n"),
+            ["cat"]
+        );
+        assert_eq!(heads("cat > x.sh <<EOF\ngrep -rn foo src/\nEOF\n"), ["cat"]);
+        assert_eq!(heads("cat <<\"EOF\"\nrm -rf build\nEOF\n"), ["cat"]);
+        // `<<-` strips leading tabs from the terminator.
+        assert_eq!(heads("cat <<-EOF\n\trm -rf build\n\tEOF\n"), ["cat"]);
+        // The skip stops at the terminator; what follows is a real command.
+        assert_eq!(heads("cat <<EOF\nx\nEOF\nrm -rf build"), ["cat", "rm"]);
+        // Two on one line take their bodies in order.
+        assert_eq!(
+            heads("cat <<A <<B\nrm -rf a\nA\nrm -rf b\nB\nrm -rf real"),
+            ["cat", "rm"]
+        );
+        // An unterminated body runs to the end rather than leaking commands.
+        assert_eq!(heads("cat <<EOF\nrm -rf build\n"), ["cat"]);
+    }
+
+    #[test]
+    fn a_herestring_is_a_word_not_a_body() {
+        let segs = lex("grep foo <<< \"$var\"\nrm -rf build");
+        assert_eq!(
+            segs.iter().map(|s| s.head.as_str()).collect::<Vec<_>>(),
+            ["grep", "rm"],
+            "a herestring must not swallow the following line"
+        );
+        assert_eq!(segs[0].args, ["foo"]);
+    }
+
+    #[test]
+    fn spans_survive_a_skipped_heredoc() {
+        let cmd = "cat <<EOF\nx\nEOF\nrm -rf build";
+        let segs = lex(cmd);
+        let span = segs[1].head_span.expect("top-level span");
+        assert_eq!(&cmd[span.start..span.end], "rm");
     }
 
     #[test]

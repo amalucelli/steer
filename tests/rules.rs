@@ -652,3 +652,64 @@ fn init_writes_a_starter_config_once() {
     assert_eq!(code, 2, "a second init must not clobber the first");
     assert!(out.contains("already exists"), "{out}");
 }
+
+// A heredoc body is data — a script being written, a SQL blob, a commit
+// message. Lexing it as commands let a rewrite splice into the contents of a
+// file rather than into a command, changing what the user wrote with nothing in
+// the transcript to show it.
+#[test]
+fn a_heredoc_body_is_never_matched_or_rewritten() {
+    let sandbox = Sandbox::new("heredoc");
+    sandbox.stub_binary("trash");
+
+    for command in [
+        "cat > clean.sh <<'EOF'\nrm -rf build\nEOF\n",
+        "cat <<-EOF\n\trm -rf build\n\tEOF\n",
+    ] {
+        let value = decision(&sandbox, command);
+        assert_eq!(value, serde_json::Value::Null, "{command:?}");
+    }
+
+    // A search written into a file is text, not a search.
+    let value = decision(&sandbox, "cat > x.sh <<EOF\ngrep -rn foo src/\nEOF\n");
+    assert!(!is_denied(&value), "{value}");
+
+    // The skip stops at the terminator, so a command after it is still seen and
+    // is the only thing the rewrite touches.
+    let value = decision(&sandbox, "cat <<EOF\nx\nEOF\nrm -rf build");
+    assert_eq!(
+        value.pointer("/hookSpecificOutput/updatedInput/command"),
+        Some(&serde_json::json!("cat <<EOF\nx\nEOF\ntrash build"))
+    );
+}
+
+// edit-over-python fires on the invocation, which is outside the body it now
+// skips.
+#[test]
+fn skipping_bodies_does_not_disarm_the_python_rule() {
+    let sandbox = Sandbox::new("heredocpython");
+    assert!(is_denied(&decision(
+        &sandbox,
+        "python3 - <<'PY'\nprint(1)\nPY\n"
+    )));
+}
+
+// A herestring is a single word, not a body. `heredoc_at` declines on `<<<`,
+// so it takes the path it always did and the line after it is still a command
+// rather than something to skip.
+#[test]
+fn a_herestring_is_unaffected() {
+    let sandbox = Sandbox::new("herestring");
+    sandbox.stub_binary("trash");
+
+    // The herestring's own segment reads as it always did: its target word is
+    // consumed as a redirect target, leaving `grep foo` a search.
+    assert!(is_denied(&decision(&sandbox, "grep foo <<< \"$var\"")));
+
+    let value = decision(&sandbox, "cat <<< \"$var\"\nrm -rf build");
+    assert_eq!(
+        value.pointer("/hookSpecificOutput/updatedInput/command"),
+        Some(&serde_json::json!("cat <<< \"$var\"\ntrash build")),
+        "the line after a herestring is still a command"
+    );
+}
