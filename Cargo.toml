@@ -1,0 +1,33 @@
+[package]
+name = "steer"
+version = "0.1.0"
+edition = "2021"
+description = "A Claude Code hook that steers tool calls toward the right tool — a configurable rule engine over shell-aware payloads."
+authors = ["Alexandre Malucelli <alexandre@malucelli.net>"]
+license = "MIT"
+repository = "https://github.com/amalucelli/steer"
+homepage = "https://github.com/amalucelli/steer"
+readme = "README.md"
+keywords = ["claude", "hook", "shell", "cli", "automation"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "steer"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9"
+anyhow = "1.0"
+globset = "0.4"
+regex = "1.11"
+
+[profile.release]
+lto = true
+codegen-units = 1
+# Not `abort`: the hook path catches unwinds to stay fail-open, and an aborting
+# panic would block the tool call it was supposed to let through.
+panic = "unwind"
+strip = true
+opt-level = 3

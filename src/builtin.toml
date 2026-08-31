@@ -1,0 +1,96 @@
+# Compiled into the binary and active with no config at all, so installing
+# steer is a one-line dotfiles entry. Disable any of them by name:
+#
+#   disable = ["fff-over-grep"]
+
+# A hook can rewrite tool input but cannot switch tools, so pointing a shell
+# search at the fff MCP server has to be a deny with guidance.
+#
+# Three escapes are deliberate. A search after a pipe is filtering output that
+# already exists, a path outside the index (absolute, home, node_modules) is
+# not something fff can answer, and a find carrying an action primary is doing
+# work no search tool can do.
+[[rules]]
+name = "fff-over-grep"
+description = "Shell searches over indexed paths belong to the fff MCP tools."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["grep", "egrep", "fgrep", "rg", "ag", "ack", "ack-grep", "ugrep"] }
+pipeline_start = { is = true }
+args = { none_glob = ["/*", "~*", "node_modules*", "*/node_modules*"] }
+
+# `find -delete` and `find -exec` traverse in order to act on what they find.
+# Denying them would point at a tool that can only report paths, so the
+# guidance would be unfollowable.
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["find", "fd", "fdfind"] }
+pipeline_start = { is = true }
+args = { none_glob = ["/*", "~*", "node_modules*", "*/node_modules*"], none_of = ["-delete", "-exec", "-execdir", "-ok", "-okdir", "--exec", "--exec-batch"] }
+
+# git's own options are peeled during enrichment, so this holds for
+# `git -C /repo grep` as much as for a bare `git grep`.
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["grep"] }
+pipeline_start = { is = true }
+args = { none_glob = ["/*", "~*", "node_modules*", "*/node_modules*"] }
+
+[rules.action]
+kind = "deny"
+message = """
+Use the fff MCP tools instead of a shell search.
+
+  mcp__fff__grep       search file contents for an identifier
+  mcp__fff__find_files find files by name or topic
+  mcp__fff__multi_grep several identifiers in one call
+
+These are deferred tools. If they are not already in context, load their \
+schemas first with \
+ToolSearch("select:mcp__fff__grep,mcp__fff__find_files,mcp__fff__multi_grep").
+
+They are frecency-ranked and index-aware. A shell search after a pipe, one \
+pointed at an absolute path, a home path, or node_modules, and a `find` that \
+acts on what it finds (`-delete`, `-exec`) are all still fine."""
+
+# `sed -n <range>p file` is a file read wearing a stream editor's clothes. The
+# Read tool gives the model line numbers and a stable window.
+[[rules]]
+name = "read-over-sed"
+description = "sed -n file reads belong to the Read tool."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["sed", "gsed"] }
+args = { any_of = ["-n", "-ne", "-nE", "-En", "--quiet", "--silent"] }
+pipeline_start = { is = true }
+
+[rules.action]
+kind = "deny"
+message = """
+Use the Read tool for file reads. It takes `offset` and `limit` for a window \
+and returns numbered lines.
+
+`sed -n` as a filter on piped input is fine; only a direct file read is \
+redirected here."""
+
+# Same-tool correction, so it happens silently. The engine holds it back
+# wherever `trash` is missing from PATH, which is every Linux VM.
+[[rules]]
+name = "trash-over-rm"
+description = "Deletes go to the trash so they stay recoverable."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["rm"] }
+
+[rules.action]
+kind = "rewrite"
+replace_head = "trash"
+drop_args = ["-r", "-R", "-f", "-rf", "-fr", "-Rf", "-fR", "-rF", "--recursive", "--force"]
+message = "steer: rewrote `rm` to `trash` so the delete stays recoverable."
