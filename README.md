@@ -94,68 +94,12 @@ steer init                                  write a starter global config
 `PostToolUse` accepts only `context` rules in v0.1. Denying or rewriting a call that already ran
 means nothing, and what else belongs there needs its own design pass.
 
-## How it works
-
-A tool call arrives as JSON on stdin: a tool name and that tool's input. Four stages turn it into a
-decision.
-
-**1. Enrichment.** The raw input is copied into a match document with `tool_name` beside it. A Bash
-payload gets one more thing: the command line is lexed into `parsed.segments`, so rules can reason
-about what is actually being run instead of pattern-matching a string. Other tools pass through
-unenriched — a future tool gets its own enricher, not a new config dialect.
-
-**2. Matching.** Every rule is evaluated against that document. One path syntax reaches all of it,
-so `file_path` on an Edit payload and `parsed.segments` on a Bash one read the same way.
-
-**3. Resolution.** All matching rules count, and the most restrictive action decides:
-**deny > rewrite > context**. File order carries no meaning, so a repo-level config can never
-accidentally weaken a global deny. Reasons from every matching rule are concatenated, so the whole
-story reaches the model rather than only the rule that happened to win.
-
-**4. Response.** A decision goes back out as JSON, and the harness applies it.
-
-### Bash enrichment
-
-A segment is one pipeline stage with its wrappers peeled:
-
-| Field | |
-| --- | --- |
-| `head` | basename of the command, so `/usr/bin/grep` and `grep` compare equal |
-| `args` | its arguments, unquoted, with redirection targets removed |
-| `pipeline_start` | true when the stage runs first in its pipeline |
-| `in_workspace` | true when the stage reaches into the session's working tree |
-| `depth` | 0 for the command line, higher inside `bash -c` or `$(...)` |
-| `wrappers` | what was peeled to get here |
-
-The split is asymmetric on purpose. `;`, `&&`, `||` and newlines start a new command; `|` only
-advances the stage within one. A `grep` after a pipe is filtering something that already ran, which
-is legitimate — `pipeline_start` is how a rule tells the two apart.
-
-Peeled as wrappers: leading `VAR=value` assignments, `env`, `sudo`, `time`, `nice`, `command`,
-`xargs`, `timeout <duration>`, and the shell keywords `if`, `then`, `elif`, `else`, `while`,
-`until`, `do`. `bash -c '...'` (and `sh`, `zsh`, and combined forms like `-lc`) re-enters the lexer
-on the script, as does `$(...)`.
-
-An assignment is only peeled when the name before `=` is a shell identifier. A looser test eats
-flags like `--include="*.go"` and lets the search they belong to through untouched.
-
-`git` keeps its head but has its own leading options peeled (`-C <path>`, `-c <k=v>`, `--git-dir`,
-`--no-pager`, …), so `args.0` is the subcommand whether or not any were given. A rule written for
-`git grep` catches `git -C /repo grep` without having to say so.
-
-`in_workspace` is about where an argument lands, not how it is spelled — an absolute path into the
-working tree is the same search as the relative one, and agents write absolute paths constantly.
-Path-shaped arguments are resolved against the session's working directory, with a leading `~`
-expanded and `.` and `..` folded, and without touching the disk, so a search over a directory that
-does not exist yet still has a location. A segment is in the workspace when any of them resolves
-inside it, or when it has no path argument at all and therefore works on the current directory. An
-argument carrying glob or regex metacharacters is what the command is looking for rather than
-where, and does not count as a location.
-
-The field is absent when the payload carries no working directory, so a rule asking for it declines
-rather than guessing.
-
 ## Writing a rule
+
+A tool call arrives as JSON: a tool name and that tool's input. steer copies it into a match
+document, adds `parsed.segments` when the tool is Bash, evaluates every rule against it, and
+returns the strongest action any of them asked for — **deny > rewrite > context**. Reasons from
+every matching rule are concatenated, so file order never changes the outcome.
 
 A complete rule, ready to copy:
 
@@ -186,6 +130,40 @@ for `grep`-like commands, one for `git grep`.
 correlation work. The block above asks whether *one* segment has head `curl` *and* starts its
 pipeline *and* is not pointed at localhost. Without a shared binding, `gh pr list | curl -X POST`
 would match by taking the head from the second segment and the pipeline position from the first.
+
+### The match document
+
+Every payload carries `tool_name` plus the tool's own input fields — `command` for Bash,
+`file_path` for Read and Edit. A Bash payload also gets `parsed.segments`, one entry per pipeline
+stage with its wrappers peeled:
+
+| Field | |
+| --- | --- |
+| `head` | basename of the command, so `/usr/bin/grep` and `grep` compare equal |
+| `args` | its arguments, unquoted, with redirection targets removed |
+| `pipeline_start` | true when the stage runs first in its pipeline |
+| `in_workspace` | true when the stage reaches into the session's working tree |
+| `depth` | 0 for the command line, higher inside `bash -c` or `$(...)` |
+| `wrappers` | what was peeled to get here |
+
+`;`, `&&`, `||` and newlines start a new segment; `|` only advances the stage within one. A `grep`
+after a pipe is filtering something that already ran, and `pipeline_start` is how a rule tells that
+from a search.
+
+Peeled as wrappers: leading `VAR=value` assignments — only when the name is a shell identifier, so
+`--include="*.go"` survives — plus `env`, `sudo`, `time`, `nice`, `command`, `xargs`,
+`timeout <duration>`, and the shell keywords `if`, `then`, `elif`, `else`, `while`, `until`, `do`.
+`bash -c '...'` and `$(...)` re-enter the lexer on their script. `git` keeps its head but loses its
+own leading options (`-C <path>`, `-c <k=v>`, `--git-dir`, …), so `args.0` is always the
+subcommand. Heredoc bodies are data and produce no segments at all.
+
+`in_workspace` is about where an argument lands, not how it is spelled — an absolute path into the
+working tree is the same search as the relative one, and agents write absolute paths constantly.
+Path-shaped arguments are resolved against the working directory (`~` expanded, `.` and `..`
+folded, no disk access), and the segment counts as inside when any of them lands there, or when it
+names no path at all. An argument carrying glob or regex metacharacters is what the command is
+looking for rather than where. The field is absent when the payload carries no working directory,
+so a rule asking for it declines rather than guessing.
 
 ### Paths
 
