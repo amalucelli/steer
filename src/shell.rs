@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn assignment_prefix_peels_but_a_flag_does_not() {
         assert_eq!(heads("GOFLAGS=-mod=mod grep -rn foo src/"), ["grep"]);
-        let segs = lex(r#"grep -rn "func .*Conv" --include="*.go" pkg/domains"#);
+        let segs = lex(r#"grep -rn "func .*Handler" --include="*.go" pkg/thing"#);
         assert_eq!(segs[0].head, "grep");
         assert!(segs[0].args.contains(&"--include=*.go".to_string()));
     }
@@ -613,10 +613,10 @@ mod tests {
     #[test]
     fn git_options_do_not_displace_the_subcommand() {
         for command in [
-            "git grep -n Conversation",
-            "git -C /repo grep -n Conversation",
-            "git -c core.pager=cat --no-pager grep -n Conversation",
-            "git --git-dir /repo/.git grep -n Conversation",
+            "git grep -n RecordStore",
+            "git -C /repo grep -n RecordStore",
+            "git -c core.pager=cat --no-pager grep -n RecordStore",
+            "git --git-dir /repo/.git grep -n RecordStore",
         ] {
             let segs = lex(command);
             assert_eq!(segs[0].head, "git", "{command}");
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn bash_dash_c_recurses() {
-        let segs = lex(r#"bash -c 'grep -rn -i "virtual" src/Chat.tsx | head -20'"#);
+        let segs = lex(r#"bash -c 'grep -rn -i "render" src/Widget.tsx | head -20'"#);
         assert_eq!(
             segs.iter().map(|s| s.head.as_str()).collect::<Vec<_>>(),
             ["grep", "head"]

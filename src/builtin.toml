@@ -63,11 +63,20 @@ They are frecency-ranked and index-aware. A shell search after a pipe, one \
 that lands outside this workspace or under node_modules, and a `find` that \
 acts on what it finds (`-delete`, `-exec`) are all still fine."""
 
-# `sed -n <range>p file` is a file read wearing a stream editor's clothes. The
-# Read tool gives the model line numbers and a stable window.
+# A file read wearing a stream editor's clothes, and its whole family. Blocking
+# one spelling only moves the intent to the next: denied `sed -n`, a model
+# reaches for `cat -n`, then `cat file | head -120`, then `awk 'NR>=655 &&
+# NR<=710' file`. All four ask for a line range from a file.
+#
+# Three discriminators carry the rule. `pipeline_start` keeps a genuine filter
+# legal, since a pager fed by a pipe is shaping output that already exists.
+# `^[^-]` demands a real file operand, which is what lets `cat > out <<EOF` and
+# a bare `head -5` through. And `NR` is the line-range tell that separates awk
+# paging a file from awk computing over one — a heuristic, deliberately, rather
+# than parsing the awk program.
 [[rules]]
-name = "read-over-sed"
-description = "sed -n file reads belong to the Read tool."
+name = "read-over-shell-pager"
+description = "Shell file reads and line-range pagers belong to the Read tool."
 tool = "Bash"
 
 [[rules.match]]
@@ -76,16 +85,38 @@ head = { any_of = ["sed", "gsed"] }
 args = { any_of = ["-n", "-ne", "-nE", "-En", "--quiet", "--silent"] }
 pipeline_start = { is = true }
 
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["cat", "head", "tail", "bat"] }
+pipeline_start = { is = true }
+in_workspace = { is = true }
+args = { matches = "^[^-]", none_of = ["-f", "--follow"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["awk", "gawk", "mawk", "perl"] }
+pipeline_start = { is = true }
+in_workspace = { is = true }
+args = { matches = "NR" }
+
 [rules.action]
 kind = "deny"
 message = """
-Use the Read tool for file reads. It takes `offset` and `limit` for a window \
-and returns numbered lines.
+Use the Read tool to read a file. It takes `offset` and `limit` for a window \
+and returns numbered lines, so there is no need to page one with a shell \
+command.
 
-`sed -n` as a filter on piped input is fine; only a direct file read is \
-redirected here."""
+If the shape is `cat file | grep foo`, the search belongs to mcp__fff__grep \
+rather than a read piped into a filter.
 
-# Same failure class as read-over-sed: a shell command standing in for a
+To feed a file into something that is not a pager — `jq`, a script, a \
+formatter — redirect it instead of catting it: `jq . < data.json`, not \
+`cat data.json | jq .`. The redirect is not a read, so it passes.
+
+Escapes: any of these after a pipe is a filter on output that already exists \
+and is fine, as is `tail -f`, and so is a file outside this workspace."""
+
+# Same failure class as the pager rule: a shell command standing in for a
 # dedicated tool. A whole program written inline to stdin is nearly always file
 # surgery, and it arrives unreviewable — the edit is invisible until it has
 # already happened.

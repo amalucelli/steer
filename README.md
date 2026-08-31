@@ -242,7 +242,7 @@ untested by anything real.
 | Name | Action | What it catches |
 | --- | --- | --- |
 | `fff-over-grep` | deny | `grep`, `rg`, `find`, `git grep` and friends leading a pipeline over an indexed path |
-| `read-over-sed` | deny | `sed -n <range>p file`, which is a file read wearing a stream editor's clothes |
+| `read-over-shell-pager` | deny | `sed -n`, `cat -n`, `cat file \| head`, `awk 'NR>=x'` — the family of ways to ask for a line range from a file |
 | `edit-over-python` | deny | `python3 - <<'PY'`, a whole program written inline to do file surgery |
 | `trash-over-rm` | rewrite | `rm` becomes `trash`, recursive and force flags dropped |
 
@@ -250,6 +250,13 @@ untested by anything real.
 unfollowable: a search after a pipe (`gh pr list | grep foo`) filters output that already exists;
 a search that lands outside the workspace, or under `node_modules`, is not something the fff tools
 can answer; and a `find` carrying an action primary (`-delete`, `-exec`) traverses in order to act.
+
+`read-over-shell-pager` covers a family rather than one command because blocking one spelling only
+moves the intent to the next. It needs a real file operand, so `cat > out <<EOF` and a bare
+`head -5` pass, and it leaves a pager fed by a pipe, `tail -f`, and files outside the workspace
+alone — at the cost of one accepted false positive, `cat a.txt b.txt > merged.txt`, since redirect
+targets are stripped from `args` and concatenating into a file is then indistinguishable from
+reading two.
 
 ## Fail open
 

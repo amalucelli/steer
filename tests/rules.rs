@@ -159,18 +159,18 @@ fn fff_over_grep_seed_cases() {
     let sandbox = Sandbox::new("seed");
 
     let deny: &[&str] = &[
-        r#"bash -c 'grep -rn -i "virtual" src/Chat.tsx | head -20'"#,
-        r#"grep -rn "func .*Conv" --include="*.go" pkg/domains 2>/dev/null | head"#,
-        r#"rg -n "createVirtualizer" src"#,
-        r#"find . -name "*.tsx" -path "*chat*""#,
-        "git grep -n Conversation",
+        r#"bash -c 'grep -rn -i "render" src/Widget.tsx | head -20'"#,
+        r#"grep -rn "func .*Handler" --include="*.go" pkg/thing 2>/dev/null | head"#,
+        r#"rg -n "createWidget" src"#,
+        r#"find . -name "*.tsx" -path "*panel*""#,
+        "git grep -n RecordStore",
         "cd /repo && grep -rn foo src/",
         "GOFLAGS=-mod=mod grep -rn foo src/",
     ];
     let allow: &[&str] = &[
         "gh pr list | grep foo",
         "go test ./... | grep FAIL",
-        r#"rg -n "solid-virtual" node_modules/@tanstack"#,
+        r#"rg -n "some-lib" node_modules/@scope"#,
         "grep -rn foo /usr/local/include",
     ];
 
@@ -186,15 +186,57 @@ fn fff_over_grep_seed_cases() {
     }
 }
 
-// `sed -n` is a file read, so fff-over-grep must not claim it; read-over-sed
+// `sed -n` is a file read, so fff-over-grep must not claim it; the pager rule
 // owns the redirect and names itself in the log.
 #[test]
-fn sed_belongs_to_read_over_sed() {
+fn sed_belongs_to_the_pager_rule() {
     let sandbox = Sandbox::new("sed");
-    let command = "sed -n 800,900p pkg/chats/sharing.go";
+    let command = "sed -n 800,900p pkg/thing/widget.go";
     assert!(is_denied(&decision(&sandbox, command)));
     assert!(denied_by(&sandbox, "fff-over-grep").is_empty());
-    assert_eq!(denied_by(&sandbox, "read-over-sed").len(), 1);
+    assert_eq!(denied_by(&sandbox, "read-over-shell-pager").len(), 1);
+}
+
+// Blocking one spelling of "give me a line range from this file" only moves the
+// intent to the next, so the rule covers the family. Observed in a live
+// session: denied `sed -n`, the model reached for `cat -n`, then a piped
+// `head`, then `awk 'NR>=x && NR<=y'`.
+#[test]
+fn every_spelling_of_a_windowed_read_is_denied() {
+    let sandbox = Sandbox::new("pager");
+
+    let deny: &[&str] = &[
+        "cat -n app/ts/clients/component.api.ts",
+        "awk 'NR>=655 && NR<=710' pkg/go/thing/widget.go",
+        "cat apps/web/src/dataFetch.ts | head -120",
+        "sed -n 800,900p pkg/thing/widget.go",
+        // Reading a file into any filter is still reading a file: the leading
+        // `cat` is what the rule claims, whatever comes after the pipe.
+        "cat data.json | sed -n 1,5p",
+        "cat data.json | grep foo",
+    ];
+    let allow: &[&str] = &[
+        // awk computing over a file rather than paging one.
+        "awk '{sum+=$1} END{print sum}' data.csv",
+        // A filter on output that already exists: the producer is a command,
+        // not a file read.
+        "git log | awk '{print $1}'",
+        "git log | sed -n 1,5p",
+        // No file operand: a heredoc write and a bare pager.
+        "cat > clean.sh <<EOF\nx\nEOF\n",
+        "head -5",
+        // Following a log is not a windowed read, and neither is a file
+        // outside the workspace.
+        "tail -f logs/app.log",
+        "cat /etc/hosts",
+    ];
+
+    for command in deny {
+        assert!(is_denied(&decision(&sandbox, command)), "{command:?}");
+    }
+    for command in allow {
+        assert!(!is_denied(&decision(&sandbox, command)), "{command:?}");
+    }
 }
 
 // Claude Code writes absolute paths constantly, so testing the spelling of a
@@ -206,14 +248,14 @@ fn an_absolute_path_into_the_workspace_is_still_a_workspace_search() {
     let w = sandbox.work().display().to_string();
 
     let deny: &[String] = &[
-        format!("grep -rn X {w}/pkg/go/domains/"),
-        "grep -rn X pkg/go/domains/".to_string(),
+        format!("grep -rn X {w}/pkg/go/thing/"),
+        "grep -rn X pkg/go/thing/".to_string(),
         "grep -rn X".to_string(),
         "cd sub && grep -rn X .".to_string(),
     ];
     let allow: &[String] = &[
         "grep -rn X /usr/local/include".to_string(),
-        "grep -rn X /Users/malucelli/Developer/github.com/amalucelli/steer/src".to_string(),
+        "grep -rn X /home/u/work/other-project/src".to_string(),
         format!("grep -rn X {w}/node_modules/pkg"),
         "grep -rn X ~/Desktop/notes".to_string(),
     ];
@@ -231,7 +273,7 @@ fn an_absolute_path_into_the_workspace_is_still_a_workspace_search() {
 #[test]
 fn a_payload_without_cwd_allows() {
     let sandbox = Sandbox::new("nocwd");
-    let payload = bash_payload("grep -rn X pkg/go/domains/", None);
+    let payload = bash_payload("grep -rn X pkg/go/thing/", None);
     assert!(!is_denied(&sandbox.hook("PreToolUse", &payload)));
 }
 
@@ -241,9 +283,9 @@ fn a_payload_without_cwd_allows() {
 fn git_global_options_do_not_hide_a_search() {
     let sandbox = Sandbox::new("gitopts");
     for command in [
-        "git grep -n Conversation",
-        "git -C /repo grep -n Conversation",
-        "git --no-pager -c core.pager=cat grep -n Conversation",
+        "git grep -n RecordStore",
+        "git -C /repo grep -n RecordStore",
+        "git --no-pager -c core.pager=cat grep -n RecordStore",
     ] {
         assert!(is_denied(&decision(&sandbox, command)), "{command}");
     }
@@ -266,7 +308,10 @@ fn inline_python_programs_are_denied_and_computations_are_not() {
         "python - <<EOF\nprint(1)\nEOF\n",
     ];
     let allow: &[&str] = &[
-        "cat data.json | python3 -",
+        // A filter being fed data, not a program editing files. The producer is
+        // a command rather than `cat <file>`, which read-over-shell-pager would
+        // claim on its own account.
+        "git log | python3 -",
         "python3 -c 'print(1/3)'",
         "python3 -c 'import json; json.load(f)'",
         "python3 script.py",
@@ -296,7 +341,7 @@ fn find_with_an_action_primary_is_not_a_search() {
     // Still a search without one, per the seed table.
     assert!(is_denied(&decision(
         &sandbox,
-        r#"find . -name "*.tsx" -path "*chat*""#
+        r#"find . -name "*.tsx" -path "*panel*""#
     )));
 }
 
@@ -340,10 +385,12 @@ fn shell_keywords_do_not_hide_a_search() {
     }
 }
 
+// The producer here is a command, so nothing in the pipeline is a file read and
+// the `sed` block's `pipeline_start` gate is the only thing under test.
 #[test]
 fn sed_after_a_pipe_is_a_filter() {
     let sandbox = Sandbox::new("sedpipe");
-    assert!(!is_denied(&decision(&sandbox, "cat foo | sed -n '1,5p'")));
+    assert!(!is_denied(&decision(&sandbox, "git log | sed -n '1,5p'")));
 }
 
 #[test]
