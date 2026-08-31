@@ -91,8 +91,8 @@ steer init                                  write a starter global config
 
 `steer check` exits 1 when the command would be denied, so it drops into a script.
 
-`PostToolUse` accepts only `context` rules in v0.1. Denying or rewriting a call that already ran
-means nothing, and what else belongs there needs its own design pass.
+`PostToolUse` accepts only `context` rules — denying or rewriting a call that already ran means
+nothing.
 
 ## Writing a rule
 
@@ -130,6 +130,26 @@ for `grep`-like commands, one for `git grep`.
 correlation work. The block above asks whether *one* segment has head `curl` *and* starts its
 pipeline *and* is not pointed at localhost. Without a shared binding, `gh pr list | curl -X POST`
 would match by taking the head from the second segment and the pipeline position from the first.
+
+Rules are not limited to Bash. Any tool is matchable through its own input fields — this one keeps
+symbol lookups off the text search and on a language server:
+
+```toml
+[[rules]]
+name = "lsp-over-grep"
+description = "Symbol lookups belong to the language server."
+tool = "Grep"
+
+[[rules.match]]
+pattern = { matches = "[a-z][a-zA-Z0-9]*[A-Z]" }
+
+[rules.action]
+kind = "deny"
+message = "That looks like a code symbol. find_references resolves it instead of guessing at text."
+```
+
+`handleSubmit` and `getUserById` match; `TODO` and `func .*Conv` do not. Name the language server
+you actually have — a deny pointing at a tool the model cannot call is worse than no rule at all.
 
 ### The match document
 
