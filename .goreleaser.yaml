@@ -1,0 +1,52 @@
+version: 2
+
+project_name: steer
+
+builds:
+  # Split by OS rather than one zigbuild block for everything: the release runs on macOS,
+  # where the Apple targets build with the native toolchain and only the Linux ones need
+  # zig to supply a glibc.
+  - id: darwin
+    builder: rust
+    tool: cargo
+    command: build
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-apple-darwin
+
+  - id: linux
+    builder: rust
+    targets:
+      - aarch64-unknown-linux-gnu
+      - x86_64-unknown-linux-gnu
+
+homebrew_casks:
+  - name: steer
+    description: "A Claude Code hook that steers tool calls toward the right tool — a configurable rule engine over shell-aware payloads."
+    homepage: https://github.com/amalucelli/steer
+    repository:
+      owner: amalucelli
+      name: homebrew-tap
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/steer"]
+          end
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - '^doc:'
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+  groups:
+    - title: 'New Features'
+      regexp: "^.*feat:+.*$"
+      order: 0
+    - title: 'Bug Fixes'
+      regexp: "^.*fix:+.*$"
+      order: 1

@@ -23,6 +23,12 @@ rewrite  cd build && trash dist
 ## Install
 
 ```sh
+brew install --cask amalucelli/tap/steer
+```
+
+Or from source:
+
+```sh
 cargo install --path . --root ~/.local
 ```
 
