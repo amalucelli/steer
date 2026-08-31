@@ -143,6 +143,7 @@ fn check(args: &[String]) -> Result<i32> {
     let tool_input = json!({ "command": command });
 
     println!("command  {command}");
+    println!("cwd      {}", cwd.display());
     println!("segments");
     for segment in shell::lex(&command) {
         let wrappers = if segment.wrappers.is_empty() {
@@ -151,12 +152,16 @@ fn check(args: &[String]) -> Result<i32> {
             format!("  wrappers={:?}", segment.wrappers)
         };
         println!(
-            "  head={} args={:?} pipeline_start={} depth={}{wrappers}",
-            segment.head, segment.args, segment.pipeline_start, segment.depth
+            "  head={} args={:?} pipeline_start={} in_workspace={} depth={}{wrappers}",
+            segment.head,
+            segment.args,
+            segment.pipeline_start,
+            rules::in_workspace(&cwd, &segment.args),
+            segment.depth
         );
     }
 
-    let decision = rules::evaluate(&ruleset, "Bash", &tool_input);
+    let decision = rules::evaluate(&ruleset, "Bash", &tool_input, Some(&cwd));
     println!(
         "matched  {}",
         if decision.fired.is_empty() {

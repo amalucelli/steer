@@ -49,6 +49,7 @@ A segment is one pipeline stage with its wrappers peeled:
 | `head` | basename of the command, so `/usr/bin/grep` and `grep` compare equal |
 | `args` | its arguments, unquoted, with redirection targets removed |
 | `pipeline_start` | true when the stage runs first in its pipeline |
+| `in_workspace` | true when the stage reaches into the session's working tree |
 | `depth` | 0 for the command line, higher inside `bash -c` or `$(...)` |
 | `wrappers` | what was peeled to get here |
 
@@ -67,6 +68,18 @@ flags like `--include="*.go"` and lets the search they belong to through untouch
 `git` keeps its head but has its own leading options peeled (`-C <path>`, `-c <k=v>`, `--git-dir`,
 `--no-pager`, …), so `args.0` is the subcommand whether or not any were given. A rule written for
 `git grep` catches `git -C /repo grep` without having to say so.
+
+`in_workspace` is about where an argument lands, not how it is spelled — an absolute path into the
+working tree is the same search as the relative one, and agents write absolute paths constantly.
+Path-shaped arguments are resolved against the session's working directory, with a leading `~`
+expanded and `.` and `..` folded, and without touching the disk, so a search over a directory that
+does not exist yet still has a location. A segment is in the workspace when any of them resolves
+inside it, or when it has no path argument at all and therefore works on the current directory. An
+argument carrying glob or regex metacharacters is what the command is looking for rather than
+where, and does not count as a location.
+
+The field is absent when the payload carries no working directory, so a rule asking for it declines
+rather than guessing.
 
 ## Writing a rule
 
@@ -151,18 +164,19 @@ written.
 
 ## Built-in rules
 
-Compiled into the binary and active with no config. One per action, so no action type ships
+Compiled into the binary and active with no config, covering every action type so none ships
 untested by anything real.
 
 | Name | Action | What it catches |
 | --- | --- | --- |
 | `fff-over-grep` | deny | `grep`, `rg`, `find`, `git grep` and friends leading a pipeline over an indexed path |
 | `read-over-sed` | deny | `sed -n <range>p file`, which is a file read wearing a stream editor's clothes |
+| `edit-over-python` | deny | `python3 - <<'PY'`, a whole program written inline to do file surgery |
 | `trash-over-rm` | rewrite | `rm` becomes `trash`, recursive and force flags dropped |
 
 `fff-over-grep` leaves three escapes open, each one a case where the guidance would otherwise be
 unfollowable: a search after a pipe (`gh pr list | grep foo`) filters output that already exists;
-a path outside the index (absolute, home-relative, `node_modules`) is not something the fff tools
+a search that lands outside the workspace, or under `node_modules`, is not something the fff tools
 can answer; and a `find` carrying an action primary (`-delete`, `-exec`) traverses in order to act.
 
 ## Install

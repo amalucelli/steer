@@ -120,18 +120,22 @@ impl Sandbox {
     }
 }
 
-fn bash_payload(command: &str) -> String {
-    serde_json::json!({
+fn bash_payload(command: &str, cwd: Option<&Path>) -> String {
+    let mut payload = serde_json::json!({
         "session_id": "test",
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
         "tool_input": { "command": command },
-    })
-    .to_string()
+    });
+    if let Some(cwd) = cwd {
+        payload["cwd"] = serde_json::json!(cwd.display().to_string());
+    }
+    payload.to_string()
 }
 
 fn decision(sandbox: &Sandbox, command: &str) -> serde_json::Value {
-    sandbox.hook("PreToolUse", &bash_payload(command))
+    let payload = bash_payload(command, Some(&sandbox.work()));
+    sandbox.hook("PreToolUse", &payload)
 }
 
 fn is_denied(value: &serde_json::Value) -> bool {
@@ -193,6 +197,44 @@ fn sed_belongs_to_read_over_sed() {
     assert_eq!(denied_by(&sandbox, "read-over-sed").len(), 1);
 }
 
+// Claude Code writes absolute paths constantly, so testing the spelling of a
+// path rather than where it lands let most real searches through: the same
+// search of the same tree was denied relative and allowed absolute.
+#[test]
+fn an_absolute_path_into_the_workspace_is_still_a_workspace_search() {
+    let sandbox = Sandbox::new("abspath");
+    let w = sandbox.work().display().to_string();
+
+    let deny: &[String] = &[
+        format!("grep -rn X {w}/pkg/go/domains/"),
+        "grep -rn X pkg/go/domains/".to_string(),
+        "grep -rn X".to_string(),
+        "cd sub && grep -rn X .".to_string(),
+    ];
+    let allow: &[String] = &[
+        "grep -rn X /usr/local/include".to_string(),
+        "grep -rn X /Users/malucelli/Developer/github.com/amalucelli/steer/src".to_string(),
+        format!("grep -rn X {w}/node_modules/pkg"),
+        "grep -rn X ~/Desktop/notes".to_string(),
+    ];
+
+    for command in deny {
+        assert!(is_denied(&decision(&sandbox, command)), "{command}");
+    }
+    for command in allow {
+        assert!(!is_denied(&decision(&sandbox, command)), "{command}");
+    }
+}
+
+// Where the workspace is comes from the payload alone. Without it the rule
+// declines rather than guessing, which is the fail-open default everywhere.
+#[test]
+fn a_payload_without_cwd_allows() {
+    let sandbox = Sandbox::new("nocwd");
+    let payload = bash_payload("grep -rn X pkg/go/domains/", None);
+    assert!(!is_denied(&sandbox.hook("PreToolUse", &payload)));
+}
+
 // `git -C <path>` is the form the model is told to use for other-repo work, so
 // it has to reach the same rule a bare `git grep` does.
 #[test]
@@ -210,6 +252,33 @@ fn git_global_options_do_not_hide_a_search() {
         &sandbox,
         "git -C /repo commit -m grep"
     )));
+}
+
+// A whole program written inline to stdin is file surgery; `-c` is a short
+// computation. Matching one and not the other is the whole precision of this
+// rule, so both halves are pinned here.
+#[test]
+fn inline_python_programs_are_denied_and_computations_are_not() {
+    let sandbox = Sandbox::new("python");
+
+    let deny: &[&str] = &[
+        "python3 - <<'PY'\nimport pathlib\npathlib.Path('x').write_text('y')\nPY\n",
+        "python - <<EOF\nprint(1)\nEOF\n",
+    ];
+    let allow: &[&str] = &[
+        "cat data.json | python3 -",
+        "python3 -c 'print(1/3)'",
+        "python3 -c 'import json; json.load(f)'",
+        "python3 script.py",
+        "python3 -m pytest",
+    ];
+
+    for command in deny {
+        assert!(is_denied(&decision(&sandbox, command)), "{command:?}");
+    }
+    for command in allow {
+        assert!(!is_denied(&decision(&sandbox, command)), "{command:?}");
+    }
 }
 
 // A find that acts on what it traverses is not a search, and the fff tools
@@ -420,6 +489,7 @@ fn every_deny_is_logged_with_its_rule_and_agent_type() {
     let payload = serde_json::json!({
         "session_id": "s1",
         "agent_type": "Explore",
+        "cwd": sandbox.work().display().to_string(),
         "tool_name": "Bash",
         "tool_input": { "command": "grep -rn foo src" },
     })
@@ -456,7 +526,7 @@ fn broken_input_and_broken_config_still_allow() {
     sandbox.write_global("this is not = valid toml [[[\n");
     let stdout = sandbox.run(
         &["hook", "--event", "PreToolUse"],
-        &bash_payload("grep -rn foo src"),
+        &bash_payload("grep -rn foo src", Some(&sandbox.work())),
     );
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("json");
     assert!(!is_denied(&value));
@@ -472,7 +542,7 @@ fn an_unknown_event_allows_rather_than_blocks() {
     let sandbox = Sandbox::new("badevent");
     let stdout = sandbox.run(
         &["hook", "--event", "Nonsense"],
-        &bash_payload("grep -rn x src"),
+        &bash_payload("grep -rn x src", Some(&sandbox.work())),
     );
     assert!(stdout.contains("systemMessage"), "{stdout}");
     assert!(!stdout.contains("\"deny\""));

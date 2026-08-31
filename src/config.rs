@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn builtins_compile() {
         let file: ConfigFile = toml::from_str(BUILTIN).expect("parse built-ins");
-        assert_eq!(file.rules.len(), 3);
+        assert_eq!(file.rules.len(), 4);
         for spec in file.rules {
             Rule::compile(spec).expect("compile built-in");
         }

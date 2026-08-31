@@ -7,9 +7,13 @@
 # search at the fff MCP server has to be a deny with guidance.
 #
 # Three escapes are deliberate. A search after a pipe is filtering output that
-# already exists, a path outside the index (absolute, home, node_modules) is
-# not something fff can answer, and a find carrying an action primary is doing
-# work no search tool can do.
+# already exists, a search that lands outside the workspace or under
+# node_modules is not something fff can answer, and a find carrying an action
+# primary is doing work no search tool can do.
+#
+# `in_workspace` asks where the arguments resolve to, not how they are spelled.
+# An absolute path into the working tree is the same search as the relative one,
+# and Claude Code writes absolute paths constantly.
 [[rules]]
 name = "fff-over-grep"
 description = "Shell searches over indexed paths belong to the fff MCP tools."
@@ -19,7 +23,8 @@ tool = "Bash"
 any = "parsed.segments"
 head = { any_of = ["grep", "egrep", "fgrep", "rg", "ag", "ack", "ack-grep", "ugrep"] }
 pipeline_start = { is = true }
-args = { none_glob = ["/*", "~*", "node_modules*", "*/node_modules*"] }
+in_workspace = { is = true }
+args = { none_glob = ["node_modules*", "*/node_modules*"] }
 
 # `find -delete` and `find -exec` traverse in order to act on what they find.
 # Denying them would point at a tool that can only report paths, so the
@@ -28,7 +33,8 @@ args = { none_glob = ["/*", "~*", "node_modules*", "*/node_modules*"] }
 any = "parsed.segments"
 head = { any_of = ["find", "fd", "fdfind"] }
 pipeline_start = { is = true }
-args = { none_glob = ["/*", "~*", "node_modules*", "*/node_modules*"], none_of = ["-delete", "-exec", "-execdir", "-ok", "-okdir", "--exec", "--exec-batch"] }
+in_workspace = { is = true }
+args = { none_glob = ["node_modules*", "*/node_modules*"], none_of = ["-delete", "-exec", "-execdir", "-ok", "-okdir", "--exec", "--exec-batch"] }
 
 # git's own options are peeled during enrichment, so this holds for
 # `git -C /repo grep` as much as for a bare `git grep`.
@@ -37,7 +43,8 @@ any = "parsed.segments"
 head = { any_of = ["git"] }
 "args.0" = { any_of = ["grep"] }
 pipeline_start = { is = true }
-args = { none_glob = ["/*", "~*", "node_modules*", "*/node_modules*"] }
+in_workspace = { is = true }
+args = { none_glob = ["node_modules*", "*/node_modules*"] }
 
 [rules.action]
 kind = "deny"
@@ -53,7 +60,7 @@ schemas first with \
 ToolSearch("select:mcp__fff__grep,mcp__fff__find_files,mcp__fff__multi_grep").
 
 They are frecency-ranked and index-aware. A shell search after a pipe, one \
-pointed at an absolute path, a home path, or node_modules, and a `find` that \
+that lands outside this workspace or under node_modules, and a `find` that \
 acts on what it finds (`-delete`, `-exec`) are all still fine."""
 
 # `sed -n <range>p file` is a file read wearing a stream editor's clothes. The
@@ -77,6 +84,35 @@ and returns numbered lines.
 
 `sed -n` as a filter on piped input is fine; only a direct file read is \
 redirected here."""
+
+# Same failure class as read-over-sed: a shell command standing in for a
+# dedicated tool. A whole program written inline to stdin is nearly always file
+# surgery, and it arrives unreviewable — the edit is invisible until it has
+# already happened.
+#
+# Matching `-` and not `-c` is the whole precision of this rule. `-c` is how a
+# short computation gets written and is overwhelmingly legitimate.
+[[rules]]
+name = "edit-over-python"
+description = "Inline Python programs fed to stdin belong to the Edit and Write tools."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["python", "python3"] }
+"args.0" = { any_of = ["-"] }
+pipeline_start = { is = true }
+
+[rules.action]
+kind = "deny"
+message = """
+Use the Edit tool to change a file and the Write tool to create one. Both show \
+the change in the transcript, and Edit fails loudly when the text it was told \
+to replace is not there, rather than writing something unintended.
+
+Two escapes. `python3 -c` for a short computation is fine, and so is a real \
+script written to a file and then run. `cat data.json | python3 -` is a filter \
+being fed data, not a program editing files, and is fine too."""
 
 # Same-tool correction, so it happens silently. The engine holds it back
 # wherever `trash` is missing from PATH, which is every Linux VM.

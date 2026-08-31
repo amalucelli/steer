@@ -65,22 +65,25 @@ fn decide(event: Event) -> Result<Option<String>> {
         .context("reading the hook payload from stdin")?;
     let payload: Payload = serde_json::from_str(&raw).context("parsing the hook payload")?;
 
-    let cwd = payload
-        .cwd
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or(std::env::current_dir()?);
+    // The payload's cwd is the session's, and the only thing that can say where
+    // the workspace is; a rule that needs it declines when it is missing. Config
+    // discovery is a different question and falls back to the process cwd.
+    let workspace = payload.cwd.as_deref().map(PathBuf::from);
+    let config_cwd = match &workspace {
+        Some(cwd) => cwd.clone(),
+        None => std::env::current_dir()?,
+    };
     let tool_name = payload.tool_name.clone().unwrap_or_default();
     let tool_input = payload.tool_input.clone().unwrap_or_else(|| json!({}));
 
-    let mut ruleset = config::load(&cwd)?;
+    let mut ruleset = config::load(&config_cwd)?;
     // Denying or rewriting a call that already ran means nothing, so after the
     // fact only context injection is left.
     if event == Event::PostToolUse {
         ruleset.retain(|rule| matches!(rule.spec.action, rules::Action::Context { .. }));
     }
 
-    let decision = rules::evaluate(&ruleset, &tool_name, &tool_input);
+    let decision = rules::evaluate(&ruleset, &tool_name, &tool_input, workspace.as_deref());
     if decision.outcome != Outcome::Allow {
         log::record(event, &payload, &tool_name, &tool_input, &decision);
     }
