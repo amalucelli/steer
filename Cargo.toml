@@ -1,6 +1,6 @@
 [package]
 name = "steer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A Claude Code and Codex hook that steers tool calls toward the right tool — a configurable rule engine over shell-aware payloads."
 authors = ["Alexandre Malucelli <alexandre@malucelli.net>"]
