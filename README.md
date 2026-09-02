@@ -8,7 +8,7 @@ It exists because a harness can outrank you: Claude Code's auto mode injects a s
 search with shell `grep` and read with `sed -n`, it beats anything in `CLAUDE.md`, and a hook is the
 last layer that still gets to decide.
 
-```
+```console
 $ steer check 'cd build && rm -rf dist'
 command   cd build && rm -rf dist
 segments
@@ -46,13 +46,24 @@ what differs there.
 
 ## Commands
 
-```
-steer hook --event PreToolUse|PostToolUse [--agent claude|codex]  # decide on a payload from stdin
-steer check '<command>'                                           # dry-run a command through the rules
-steer replay [--since <age>]                                      # what the rules would now answer differently
-steer suggest [--since <age>] [--strong|--all] [--draft <name>]   # escapes and uncaught shapes from the log
-steer validate                                                    # the effective ruleset and its problems
-steer init                                                        # write a starter global config
+```sh
+# decide on a payload from stdin
+steer hook --event PreToolUse|PostToolUse [--agent claude|codex]
+
+# dry-run a command through the rules
+steer check '<command>'
+
+# what the rules would now answer differently
+steer replay [--since <age>]
+
+# escapes and uncaught shapes from the log
+steer suggest [--since <age>] [--strong|--all] [--draft <name>]
+
+# the effective ruleset and its problems
+steer validate
+
+# write a starter global config
+steer init
 ```
 
 Everything from `check`'s first positional word on is the command line, so `steer check -la` reaches
