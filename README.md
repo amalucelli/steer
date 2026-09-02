@@ -8,7 +8,7 @@ It exists because a harness can outrank you: Claude Code's auto mode injects a s
 search with shell `grep` and read with `sed -n`, it beats anything in `CLAUDE.md`, and a hook is the
 last layer that still gets to decide.
 
-```console
+```js
 $ steer check 'cd build && rm -rf dist'
 command   cd build && rm -rf dist
 segments
