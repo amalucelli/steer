@@ -77,6 +77,15 @@ impl Sandbox {
             .collect()
     }
 
+    /// Writes the log the reading commands read, for the pairs that are
+    /// tedious to produce by driving the hook.
+    fn write_log(&self, entries: &[serde_json::Value]) {
+        let dir = self.dir.join("state").join("steer");
+        fs::create_dir_all(&dir).expect("create state dir");
+        let lines: Vec<String> = entries.iter().map(|entry| entry.to_string()).collect();
+        fs::write(dir.join("steer.jsonl"), lines.join("\n") + "\n").expect("write log");
+    }
+
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(BIN);
         cmd.current_dir(self.work())
@@ -88,7 +97,15 @@ impl Sandbox {
     }
 
     fn hook(&self, event: &str, payload: &str) -> serde_json::Value {
-        let stdout = self.run(&["hook", "--event", event], payload);
+        self.decide(&["hook", "--event", event, "--agent", "claude"], payload)
+    }
+
+    fn hook_as(&self, agent: &str, event: &str, payload: &str) -> serde_json::Value {
+        self.decide(&["hook", "--event", event, "--agent", agent], payload)
+    }
+
+    fn decide(&self, args: &[&str], payload: &str) -> serde_json::Value {
+        let stdout = self.run(args, payload);
         if stdout.trim().is_empty() {
             return serde_json::Value::Null;
         }
@@ -130,6 +147,13 @@ fn bash_payload(command: &str, cwd: Option<&Path>) -> String {
     if let Some(cwd) = cwd {
         payload["cwd"] = serde_json::json!(cwd.display().to_string());
     }
+    payload.to_string()
+}
+
+fn transcript_payload(command: &str, cwd: &Path, transcript: &str) -> String {
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&bash_payload(command, Some(cwd))).expect("payload json");
+    payload["transcript_path"] = serde_json::json!(transcript);
     payload.to_string()
 }
 
@@ -432,6 +456,330 @@ fn a_deny_outranks_a_rewrite() {
     assert!(value.pointer("/hookSpecificOutput/updatedInput").is_none());
 }
 
+// Codex accepts `updatedInput` only alongside an approval, which would put the
+// rewritten command past the permission prompt, so the new command has to reach
+// the model as guidance instead.
+#[test]
+fn a_rewrite_becomes_a_deny_carrying_the_command_on_codex() {
+    let sandbox = Sandbox::new("codexrewrite");
+    sandbox.stub_binary("trash");
+
+    let payload = bash_payload("cd build && rm -rf dist", Some(&sandbox.work()));
+    let value = sandbox.hook_as("codex", "PreToolUse", &payload);
+    assert!(is_denied(&value), "{value}");
+    assert!(value.pointer("/hookSpecificOutput/updatedInput").is_none());
+
+    let reason = value
+        .pointer("/hookSpecificOutput/permissionDecisionReason")
+        .and_then(serde_json::Value::as_str)
+        .expect("a deny reason");
+    assert!(reason.contains("cd build && trash dist"), "{reason}");
+}
+
+// A rewrite that only injects a flag, which is what the `--no-ext-diff` case
+// needs: no head to replace, so nothing for the PATH gate to look up either.
+const ADD_ARGS: &str = r#"
+[[rules]]
+name = "git-diff-no-ext-diff"
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["diff"] }
+args = { none_of = ["--no-ext-diff"] }
+
+[rules.action]
+kind = "rewrite"
+add_args = ["--no-ext-diff"]
+"#;
+
+fn rewritten(sandbox: &Sandbox, command: &str) -> String {
+    decision(sandbox, command)
+        .pointer("/hookSpecificOutput/updatedInput/command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("no rewrite for {command:?}"))
+        .to_string()
+}
+
+// The flag lands after the subcommand rather than after the head: `git` peels
+// its own options during enrichment, and `git --no-ext-diff diff` is the wrong
+// spelling. Redirection targets are stripped from `args`, so they are not the
+// last token even when they are the last thing written.
+#[test]
+fn add_args_appends_after_the_last_operand() {
+    let sandbox = Sandbox::new("addargs");
+    sandbox.write_global(ADD_ARGS);
+
+    assert_eq!(rewritten(&sandbox, "git diff"), "git diff --no-ext-diff");
+    assert_eq!(
+        rewritten(&sandbox, "git diff --stat"),
+        "git diff --stat --no-ext-diff"
+    );
+    assert_eq!(
+        rewritten(&sandbox, "git -C /repo diff"),
+        "git -C /repo diff --no-ext-diff"
+    );
+    assert_eq!(
+        rewritten(&sandbox, "git diff > out.txt"),
+        "git diff --no-ext-diff > out.txt"
+    );
+}
+
+// Everything after `--` is an operand by getopt convention, so a flag appended
+// past it is read as a pathspec rather than as a flag.
+#[test]
+fn add_args_lands_before_the_operand_separator() {
+    let sandbox = Sandbox::new("addargssep");
+    sandbox.write_global(ADD_ARGS);
+
+    assert_eq!(
+        rewritten(&sandbox, "git diff HEAD~1 -- src/"),
+        "git diff HEAD~1 --no-ext-diff -- src/"
+    );
+}
+
+// The rule's own `none_of` is what stops a second pass, so the engine needs no
+// idempotence of its own — and a rewrite with no head must not be held back by
+// a PATH gate that has nothing to look up.
+#[test]
+fn add_args_leaves_a_command_that_already_carries_the_flag() {
+    let sandbox = Sandbox::new("addargsidem");
+    sandbox.write_global(ADD_ARGS);
+
+    assert_eq!(
+        decision(&sandbox, "git diff --no-ext-diff"),
+        serde_json::Value::Null,
+        "expected a clean allow"
+    );
+}
+
+// One rule, one message per harness it speaks to. `ruby` is deliberately
+// untouched by any built-in, so only this rule is in play.
+const PER_AGENT: &str = r#"
+[[rules]]
+name = "ruby-per-agent"
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["ruby"] }
+
+[rules.action]
+kind = "deny"
+
+[rules.action.message]
+claude = "Use the Edit tool."
+codex = "Use apply_patch."
+"#;
+
+fn reason(value: &serde_json::Value) -> String {
+    value
+        .pointer("/hookSpecificOutput/permissionDecisionReason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+// The matching is harness-independent; only the tool it points at is not. A
+// single message forces a rule to either name one harness's tools or be gated
+// off the other entirely, which throws the matching away with it.
+#[test]
+fn a_message_can_name_a_different_tool_per_harness() {
+    let sandbox = Sandbox::new("peragent");
+    sandbox.write_global(PER_AGENT);
+    let payload = bash_payload("ruby script.rb", Some(&sandbox.work()));
+
+    let claude = sandbox.hook_as("claude", "PreToolUse", &payload);
+    assert!(is_denied(&claude), "{claude}");
+    assert!(reason(&claude).contains("Edit tool"), "{claude}");
+
+    let codex = sandbox.hook_as("codex", "PreToolUse", &payload);
+    assert!(is_denied(&codex), "{codex}");
+    assert!(reason(&codex).contains("apply_patch"), "{codex}");
+}
+
+// Naming a harness in the table is the gate: a rule with nothing to say to a
+// harness has nothing followable to deny it with either.
+#[test]
+fn a_harness_the_message_does_not_name_is_not_covered() {
+    let sandbox = Sandbox::new("peragentgate");
+    sandbox.write_global(
+        r#"
+[[rules]]
+name = "ruby-claude-only"
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["ruby"] }
+
+[rules.action]
+kind = "deny"
+
+[rules.action.message]
+claude = "Use the Edit tool."
+"#,
+    );
+    let payload = bash_payload("ruby script.rb", Some(&sandbox.work()));
+
+    assert!(is_denied(&sandbox.hook_as(
+        "claude",
+        "PreToolUse",
+        &payload
+    )));
+    assert_eq!(
+        sandbox.hook_as("codex", "PreToolUse", &payload),
+        serde_json::Value::Null,
+        "expected a clean allow"
+    );
+}
+
+// Two gates on one rule that can disagree is a rule nobody can read.
+#[test]
+fn a_per_harness_message_beside_an_agents_gate_is_a_problem() {
+    let sandbox = Sandbox::new("peragentboth");
+    sandbox.write_global(
+        r#"
+[[rules]]
+name = "ruby-double-gate"
+tool = "Bash"
+agents = ["claude"]
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["ruby"] }
+
+[rules.action]
+kind = "deny"
+
+[rules.action.message]
+claude = "Use the Edit tool."
+"#,
+    );
+    let (out, code) = cli(&sandbox, &["validate"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("ruby-double-gate"), "{out}");
+    assert!(out.contains("agents"), "{out}");
+}
+
+// The PATH gate and the nested-span hold-back both run before the agent split,
+// so a rewrite that cannot be spliced still allows everywhere.
+#[test]
+fn a_held_back_rewrite_allows_on_every_agent() {
+    let sandbox = Sandbox::new("heldboth");
+    sandbox.stub_binary("trash");
+
+    let payload = bash_payload("bash -lc 'rm -rf dist'", Some(&sandbox.work()));
+    for agent in ["claude", "codex"] {
+        assert_eq!(
+            sandbox.hook_as(agent, "PreToolUse", &payload),
+            serde_json::Value::Null,
+            "{agent}"
+        );
+    }
+}
+
+#[test]
+fn a_rule_gated_on_an_agent_is_invisible_to_the_others() {
+    let sandbox = Sandbox::new("agentgate");
+    sandbox.stub_binary("trash");
+    sandbox.write_global(
+        r#"
+[[rules]]
+name = "no-apply-patch"
+tool = "Bash"
+agents = ["codex"]
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["apply_patch"] }
+
+[rules.action]
+kind = "deny"
+message = "edit the file directly"
+"#,
+    );
+
+    let gated = bash_payload("apply_patch spec.md", Some(&sandbox.work()));
+    assert!(!is_denied(&sandbox.hook_as("claude", "PreToolUse", &gated)));
+    assert!(is_denied(&sandbox.hook_as("codex", "PreToolUse", &gated)));
+
+    // `trash-over-rm` names no agent, so both harnesses act on it.
+    let rm = bash_payload("rm -rf dist", Some(&sandbox.work()));
+    assert!(sandbox
+        .hook_as("claude", "PreToolUse", &rm)
+        .pointer("/hookSpecificOutput/updatedInput")
+        .is_some());
+    assert!(is_denied(&sandbox.hook_as("codex", "PreToolUse", &rm)));
+}
+
+// Claude Code keeps transcripts under `~/.claude/projects/` and Codex under
+// `~/.codex/sessions/`, which is enough to tell them apart with no flag in the
+// registration at all.
+#[test]
+fn the_transcript_path_picks_the_harness() {
+    let sandbox = Sandbox::new("detect");
+    sandbox.stub_binary("trash");
+
+    let codex = sandbox.decide(
+        &["hook", "--event", "PreToolUse"],
+        &transcript_payload(
+            "rm -rf dist",
+            &sandbox.work(),
+            "/home/u/.codex/sessions/2026/09/01/rollout.jsonl",
+        ),
+    );
+    assert!(is_denied(&codex), "{codex}");
+
+    let claude = sandbox.decide(
+        &["hook", "--event", "PreToolUse"],
+        &transcript_payload(
+            "rm -rf dist",
+            &sandbox.work(),
+            "/home/u/.claude/projects/-repo/session.jsonl",
+        ),
+    );
+    assert_eq!(
+        claude.pointer("/hookSpecificOutput/updatedInput/command"),
+        Some(&serde_json::json!("trash dist"))
+    );
+}
+
+// The flag is the escape hatch for a setup detection does not fit, so it has to
+// win outright rather than only break a tie.
+#[test]
+fn an_explicit_agent_beats_the_transcript_path() {
+    let sandbox = Sandbox::new("override");
+    sandbox.stub_binary("trash");
+    let payload = transcript_payload(
+        "rm -rf dist",
+        &sandbox.work(),
+        "/home/u/.claude/projects/-repo/session.jsonl",
+    );
+    assert!(is_denied(&sandbox.hook_as("codex", "PreToolUse", &payload)));
+}
+
+// Defaulting to one harness would run its guidance under the other, and that
+// failure lands in the model's context rather than on a terminal.
+#[test]
+fn an_unidentifiable_harness_allows_and_names_the_flag() {
+    let sandbox = Sandbox::new("noagent");
+    sandbox.stub_binary("trash");
+    let value = sandbox.decide(
+        &["hook", "--event", "PreToolUse"],
+        &bash_payload("rm -rf dist", Some(&sandbox.work())),
+    );
+    assert!(!is_denied(&value));
+    assert!(value.pointer("/hookSpecificOutput/updatedInput").is_none());
+
+    let message = value
+        .pointer("/hookSpecificOutput/systemMessage")
+        .and_then(serde_json::Value::as_str)
+        .expect("systemMessage names the breakage");
+    assert!(message.contains("--agent"), "{message}");
+}
+
 #[test]
 fn a_repo_overlay_disables_an_inherited_rule() {
     let sandbox = Sandbox::new("overlay");
@@ -555,14 +903,34 @@ fn every_deny_is_logged_with_its_rule_and_agent_type() {
     assert_eq!(entry["outcome"], "deny");
     assert_eq!(entry["rules"], serde_json::json!(["fff-over-grep"]));
     assert_eq!(entry["agent_type"], "Explore");
+    assert_eq!(entry["harness"], "claude");
     assert_eq!(entry["tool_input"]["command"], "grep -rn foo src");
 }
 
+// A deny is only half the story: the command that ran instead is what names the
+// spelling a rule missed, so an allowed Bash call is logged too. Other tools
+// stay out, which keeps a Write payload's file contents off disk.
 #[test]
-fn an_allowed_call_is_not_logged() {
-    let sandbox = Sandbox::new("nolog");
+fn allowed_bash_calls_are_logged_and_other_tools_are_not() {
+    let sandbox = Sandbox::new("allowlog");
+
     decision(&sandbox, "gh pr list | grep foo");
-    assert!(sandbox.log_lines().is_empty());
+    let lines = sandbox.log_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let entry: serde_json::Value = serde_json::from_str(&lines[0]).expect("json line");
+    assert_eq!(entry["outcome"], "allow");
+    assert_eq!(entry["rules"], serde_json::json!([]));
+    assert_eq!(entry["tool_input"]["command"], "gh pr list | grep foo");
+
+    let payload = serde_json::json!({
+        "session_id": "test",
+        "tool_name": "Write",
+        "tool_input": { "file_path": "notes.md", "content": "secret" },
+        "cwd": sandbox.work().display().to_string(),
+    })
+    .to_string();
+    sandbox.hook("PreToolUse", &payload);
+    assert_eq!(sandbox.log_lines().len(), 1, "a Write allow must not log");
 }
 
 // Fail-open is the hard requirement: nothing steer does may block a call it did
@@ -578,7 +946,7 @@ fn broken_input_and_broken_config_still_allow() {
 
     sandbox.write_global("this is not = valid toml [[[\n");
     let stdout = sandbox.run(
-        &["hook", "--event", "PreToolUse"],
+        &["hook", "--event", "PreToolUse", "--agent", "claude"],
         &bash_payload("grep -rn foo src", Some(&sandbox.work())),
     );
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("json");
@@ -599,6 +967,18 @@ fn an_unknown_event_allows_rather_than_blocks() {
     );
     assert!(stdout.contains("systemMessage"), "{stdout}");
     assert!(!stdout.contains("\"deny\""));
+    // The envelope lands in the model's context, so it carries what the caller
+    // can act on and none of the terminal furniture around it.
+    assert!(stdout.contains("PreToolUse, PostToolUse"), "{stdout}");
+    assert!(!stdout.contains("For more information"), "{stdout}");
+    assert!(!stdout.contains('\u{1b}'), "{stdout}");
+
+    let stdout = sandbox.run(
+        &["hook", "--bogus", "--event", "PreToolUse"],
+        &bash_payload("grep -rn x src", Some(&sandbox.work())),
+    );
+    assert!(stdout.contains("--bogus"), "{stdout}");
+    assert!(!stdout.contains("\"deny\""), "{stdout}");
 }
 
 fn cli(sandbox: &Sandbox, args: &[&str]) -> (String, i32) {
@@ -607,6 +987,256 @@ fn cli(sandbox: &Sandbox, args: &[&str]) -> (String, i32) {
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr),
         out.status.code().unwrap_or(-1),
     )
+}
+
+// "Nothing matched" is an answer without a reason. The reason is one condition
+// on one segment, and it is the whole point of running check on a command that
+// surprised you.
+#[test]
+fn check_names_the_condition_that_held_a_rule_back() {
+    let sandbox = Sandbox::new("nearest");
+    let (out, code) = cli(&sandbox, &["check", "gh pr list | grep foo"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("nearest   fff-over-grep"), "{out}");
+    assert!(out.contains("✗ pipeline_start"), "{out}");
+    assert!(out.contains("actual=false"), "{out}");
+
+    // A rule wanting a different binary is not a near miss, whatever else of it
+    // happens to hold.
+    assert!(!out.contains("edit-over-python"), "{out}");
+
+    let (out, _) = cli(&sandbox, &["check", "grep -rn foo src"]);
+    assert!(
+        out.contains("matched   fff-over-grep  (block 0, parsed.segments[0])"),
+        "{out}"
+    );
+}
+
+// A transition between two outcome names is the engine's vocabulary, not a
+// consequence. The report has to say what would happen to the call, that
+// nothing was written, and — since a log outlives the rules that answered it —
+// whether any of it is recent enough to be about a rule you just wrote.
+#[test]
+fn replay_reports_the_consequence_and_the_age_of_a_difference() {
+    let sandbox = Sandbox::new("replaydrift");
+    sandbox.write_log(&[serde_json::json!({
+        "ts_ms": 1_000,
+        "outcome": "deny",
+        "rules": ["fff-over-grep"],
+        "tool_name": "Bash",
+        "session_id": "s1",
+        "cwd": sandbox.work().display().to_string(),
+        // A search after a pipe is a filter, so today's rules allow it.
+        "tool_input": { "command": "gh pr list | grep foo" },
+    })]);
+
+    let (out, code) = cli(&sandbox, &["replay"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("nothing is written"), "{out}");
+    assert!(
+        out.contains("would now go through"),
+        "the consequence, not the transition: {out}"
+    );
+    assert!(
+        out.contains("fff-over-grep  gh pr list | grep foo"),
+        "the rule that stopped catching it, beside the call: {out}"
+    );
+    assert!(
+        out.contains("none from the last day"),
+        "an old difference is not about a rule just written: {out}"
+    );
+
+    // The window takes units, since checking a rule just written is a question
+    // about the last few minutes.
+    let (out, code) = cli(&sandbox, &["replay", "--since", "30m"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("none would land differently"), "{out}");
+
+    let (out, code) = cli(&sandbox, &["replay", "--since", "5x"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("unknown unit `x`"), "{out}");
+}
+
+// A draft is a recommendation whatever the comments around it say, so the one
+// case where the tool is unsure has to produce no draft at all — and say why
+// where a reader is looking, which is not inside a file they have not pasted.
+#[test]
+fn draft_declines_when_the_rule_does_not_know_the_command_that_followed() {
+    let sandbox = Sandbox::new("weak");
+    let entry = |ts_ms: u64, outcome: &str, rules: serde_json::Value, command: &str| {
+        serde_json::json!({
+            "ts_ms": ts_ms,
+            "outcome": outcome,
+            "rules": rules,
+            "tool_name": "Bash",
+            "session_id": "s1",
+            "tool_input": { "command": command },
+        })
+    };
+    sandbox.write_log(&[
+        entry(
+            1_000,
+            "deny",
+            serde_json::json!(["fff-over-grep"]),
+            "grep -n ts:security Taskfile.yml",
+        ),
+        entry(9_000, "allow", serde_json::json!([]), "task ts:security"),
+    ]);
+
+    let (out, code) = cli(&sandbox, &["suggest", "--draft", "fff-over-grep"]);
+    assert_eq!(
+        code, 2,
+        "no draft is an error exit, not empty output: {out}"
+    );
+    assert!(!out.contains("[[rules]]"), "nothing pasteable: {out}");
+    assert!(out.contains("says nothing about `task`"), "{out}");
+    assert!(out.contains("steer suggest --draft task"), "{out}");
+
+    // The report counts a weak pair rather than printing it: it is a question,
+    // and there are always more questions than findings.
+    let (out, _) = cli(&sandbox, &["suggest"]);
+    assert!(!out.contains("escape "), "{out}");
+    assert!(out.contains("weak      1 more pair"), "{out}");
+
+    // Asking for them says the same thing in a line, per pair.
+    let (out, _) = cli(&sandbox, &["suggest", "--all"]);
+    assert!(out.contains("signal  weak"), "{out}");
+}
+
+// An example that stops being true has to fail, or it is just a comment.
+#[test]
+fn validate_runs_the_examples_a_rule_declares() {
+    let sandbox = Sandbox::new("examples");
+    sandbox.write_global(
+        r#"
+[[rules]]
+name = "no-prod-psql"
+tool = "Bash"
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["psql"] }
+[rules.action]
+kind = "deny"
+message = "x"
+[rules.test]
+fires = ["psql -h prod"]
+ignores = ["psql -h replica", "ls -la"]
+"#,
+    );
+    let (out, code) = cli(&sandbox, &["validate"]);
+    assert_eq!(code, 1, "a wrong example is a problem: {out}");
+    assert!(
+        out.contains("`ignores` example \"psql -h replica\" fires `no-prod-psql`"),
+        "{out}"
+    );
+    assert!(
+        out.contains("config.toml:13:12"),
+        "expected the example's own line and column, got {out}"
+    );
+    assert!(!out.contains("\"psql -h prod\""), "{out}");
+}
+
+// `fires` only asserts that a rewrite happened. What it produced was displayed
+// and unchecked, so a splice that started cutting the wrong span stayed silent.
+#[test]
+fn validate_checks_what_a_rewrite_produces() {
+    let sandbox = Sandbox::new("rewriteexamples");
+    sandbox.write_global(
+        r#"
+[[rules]]
+name = "trash-over-rm"
+tool = "Bash"
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["rm"] }
+[rules.action]
+kind = "rewrite"
+replace_head = "trash"
+drop_args = ["-rf"]
+[rules.test]
+rewrites = { "rm -rf dist" = "trash dist", "cd build && rm -rf out" = "cd build && rm out" }
+"#,
+    );
+
+    let (out, code) = cli(&sandbox, &["validate"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("\"cd build && trash out\""),
+        "expected the produced command: {out}"
+    );
+    // `trash` is absent from the sandbox PATH, so this also pins that the
+    // assertion survives a rewrite the engine would hold back at runtime.
+    assert!(!out.contains("\"trash dist\""), "{out}");
+}
+
+// A command the rule does not touch has no output to claim.
+#[test]
+fn a_rewrites_example_on_a_rule_that_never_rewrites_is_a_problem() {
+    let sandbox = Sandbox::new("rewritewrongkind");
+    sandbox.write_global(
+        r#"
+[[rules]]
+name = "no-prod-psql"
+tool = "Bash"
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["psql"] }
+[rules.action]
+kind = "deny"
+message = "x"
+[rules.test]
+rewrites = { "psql -h prod" = "psql -h replica" }
+"#,
+    );
+
+    let (out, code) = cli(&sandbox, &["validate"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("no-prod-psql"), "{out}");
+    assert!(out.contains("rewrite"), "{out}");
+}
+
+#[test]
+fn help_lists_every_subcommand() {
+    let sandbox = Sandbox::new("help");
+    let (out, code) = cli(&sandbox, &["--help"]);
+    assert_eq!(code, 0, "{out}");
+    for subcommand in ["hook", "check", "validate", "init"] {
+        assert!(out.contains(subcommand), "{subcommand} missing from {out}");
+    }
+    assert!(out.contains("Examples:"), "{out}");
+}
+
+#[test]
+fn a_misspelled_flag_is_corrected_rather_than_dumped() {
+    let sandbox = Sandbox::new("typo");
+    let (out, code) = cli(&sandbox, &["--verson"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(
+        out.contains("a similar argument exists: '--version'"),
+        "{out}"
+    );
+}
+
+#[test]
+fn the_version_flag_keeps_its_short_form() {
+    let sandbox = Sandbox::new("version");
+    let (out, code) = cli(&sandbox, &["-v"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.starts_with(&format!("steer {}", env!("CARGO_PKG_VERSION"))),
+        "{out}"
+    );
+}
+
+// clap reports help through the same `Err` as a parse failure, so the fail-open
+// branch has to let it past instead of wrapping it in a decision envelope.
+#[test]
+fn hook_help_prints_help_not_a_decision() {
+    let sandbox = Sandbox::new("hookhelp");
+    let (out, code) = cli(&sandbox, &["hook", "--help"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("--event"), "{out}");
+    assert!(!out.contains("hookSpecificOutput"), "{out}");
 }
 
 #[test]
@@ -621,7 +1251,7 @@ fn check_prints_the_parse_the_rule_and_the_message() {
 
     let (out, code) = cli(&sandbox, &["check", "gh pr list | grep foo"]);
     assert_eq!(code, 0);
-    assert!(out.contains("action   allow"), "{out}");
+    assert!(out.contains("action    allow"), "{out}");
 }
 
 #[test]
@@ -638,6 +1268,40 @@ fn validate_accepts_the_built_ins_alone() {
     let (out, code) = cli(&sandbox, &["validate"]);
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("ok"), "{out}");
+}
+
+// A rule count cannot answer which definition of a name is the live one, which
+// is the question a stack of three sources raises.
+#[test]
+fn validate_shows_what_the_stack_did_to_each_rule() {
+    let sandbox = Sandbox::new("validtree");
+    sandbox.write_global("disable = [\"edit-over-python\"]\n");
+    sandbox.write(
+        ".steer.toml",
+        r#"
+[[rules]]
+name = "trash-over-rm"
+tool = "Bash"
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["rm"] }
+[rules.action]
+kind = "context"
+message = "x"
+"#,
+    );
+
+    let (out, code) = cli(&sandbox, &["validate"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("disabled by"), "{out}");
+    assert!(out.contains("replaced by"), "{out}");
+    assert!(
+        out.contains("match   any parsed.segments  head=rm"),
+        "conditions: {out}"
+    );
+    // Piped output carries no escapes, so it stays greppable.
+    assert!(!out.contains('\u{1b}'), "{out}");
+    assert!(out.contains("ok        3 rules"), "{out}");
 }
 
 #[test]

@@ -22,7 +22,7 @@ builds:
 
 homebrew_casks:
   - name: steer
-    description: "A Claude Code hook that steers tool calls toward the right tool — a configurable rule engine over shell-aware payloads."
+    description: "A Claude Code and Codex hook that steers tool calls toward the right tool — a configurable rule engine over shell-aware payloads."
     homepage: https://github.com/amalucelli/steer
     repository:
       owner: amalucelli

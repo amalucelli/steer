@@ -1,4 +1,4 @@
-// A Claude Code hook that steers tool calls toward the right tool.
+// A hook for Claude Code and Codex that steers tool calls toward the right tool.
 //
 // Auto mode injects a system-level directive telling the model to search with
 // shell `grep` and read with `sed -n`, outranking anything in CLAUDE.md. This
@@ -8,21 +8,25 @@
 // The split of responsibility across the crate: `shell` turns a command line
 // into pipeline segments with their wrappers peeled, `rules` holds the
 // predicate language and the engine that runs it, `config` stacks built-in,
-// global, and repo-overlay sources, `hook` speaks the Claude Code protocol, and
-// `log` records what was acted on.
+// global, and repo-overlay sources, `replay` answers the questions only a
+// history can, `hook` speaks the hook protocol, `log` records what was acted
+// on, and `cli` is the terminal surface over all of it.
 
+mod cli;
 mod config;
 mod hook;
 mod log;
+mod replay;
 mod rules;
 mod shell;
 
-use anyhow::{bail, Context, Result};
-use rules::Outcome;
-use serde_json::json;
+use clap::Parser;
+use cli::{Cli, Sub};
+use serde::Deserialize;
 use std::panic::AssertUnwindSafe;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "PascalCase")]
 pub enum Event {
     PreToolUse,
     PostToolUse,
@@ -35,28 +39,64 @@ impl Event {
             Event::PostToolUse => "PostToolUse",
         }
     }
+}
 
-    fn parse(name: &str) -> Result<Event> {
-        match name {
-            "PreToolUse" => Ok(Event::PreToolUse),
-            "PostToolUse" => Ok(Event::PostToolUse),
-            other => bail!("unsupported --event `{other}`"),
+/// The harness steer is speaking to. Codex copies Claude Code's hook protocol
+/// closely enough to share the rule engine, but not its tools or its answer to
+/// a rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[value(rename_all = "lowercase")]
+pub enum Agent {
+    Claude,
+    Codex,
+}
+
+impl Agent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Agent::Claude => "claude",
+            Agent::Codex => "codex",
         }
     }
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let subcommand = args.next().unwrap_or_default();
-    let args: Vec<String> = args.collect();
+    // clap answers a parse error by printing usage and exiting 2. The hook path
+    // may do neither, so it has to be recognised before clap gets a say.
+    let hook_path = std::env::args().nth(1).as_deref() == Some("hook");
+
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // `use_stderr` is false only for --help and --version, which stay
+        // ordinary output even under `hook`.
+        Err(err) if hook_path && err.use_stderr() => {
+            println!(
+                "{}",
+                hook::breakage(Event::PreToolUse, &format!("steer: {}", terse(&err)))
+            );
+            std::process::exit(0);
+        }
+        Err(err) => err.exit(),
+    };
 
     // Only the hook path is fail-open. `check`, `validate`, and `init` are
     // developer tools and should say so loudly when something is wrong.
-    if subcommand == "hook" {
-        std::process::exit(run_hook(&args));
-    }
+    let result = match cli.command {
+        Sub::Hook { event, agent } => std::process::exit(run_hook(event, agent)),
+        Sub::Check { command } => cli::check(&command),
+        Sub::Replay { since } => cli::replay_cmd(since),
+        Sub::Suggest {
+            since,
+            draft,
+            strong,
+            all,
+        } => cli::suggest_cmd(since, draft, strong, all),
+        Sub::Validate => cli::validate(),
+        Sub::Init => cli::init(),
+    };
 
-    let code = match dispatch(&subcommand, &args) {
+    let code = match result {
         Ok(code) => code,
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -66,24 +106,22 @@ fn main() {
     std::process::exit(code);
 }
 
+/// clap renders an error as several paragraphs: the problem, then a usage block
+/// and a `--help` hint. Only the first says anything useful once it is buried in
+/// a harness message.
+fn terse(err: &clap::Error) -> String {
+    let rendered = err.to_string();
+    let head = rendered.split("\n\n").next().unwrap_or(&rendered);
+    head.trim().trim_start_matches("error: ").trim().to_string()
+}
+
 /// Swallows a panic as well as an error. The release profile keeps `unwind` for
 /// exactly this: an aborting panic would take down the tool call steer exists
 /// to let through.
-fn run_hook(args: &[String]) -> i32 {
-    let event = match parse_event(args) {
-        Ok(event) => event,
-        Err(err) => {
-            println!(
-                "{}",
-                hook::breakage(Event::PreToolUse, &format!("steer: {err:#}"))
-            );
-            return 0;
-        }
-    };
-
+fn run_hook(event: Event, agent: Option<Agent>) -> i32 {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| hook::run(event)));
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| hook::run(event, agent)));
     std::panic::set_hook(previous);
 
     result.unwrap_or_else(|_| {
@@ -96,125 +134,4 @@ fn run_hook(args: &[String]) -> i32 {
         );
         0
     })
-}
-
-fn parse_event(args: &[String]) -> Result<Event> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "--event" {
-            let name = iter.next().context("--event requires an event name")?;
-            return Event::parse(name);
-        }
-        if let Some(name) = arg.strip_prefix("--event=") {
-            return Event::parse(name);
-        }
-    }
-    bail!("hook requires --event PreToolUse|PostToolUse")
-}
-
-fn dispatch(subcommand: &str, args: &[String]) -> Result<i32> {
-    match subcommand {
-        "check" => check(args),
-        "validate" => validate(),
-        "init" => init(),
-        "-v" | "--version" => {
-            println!("steer {}", env!("CARGO_PKG_VERSION"));
-            Ok(0)
-        }
-        _ => Ok(usage()),
-    }
-}
-
-fn usage() -> i32 {
-    eprintln!(
-        "usage: steer <hook|check|validate|init>\n\
-         \n\
-         hook --event PreToolUse|PostToolUse   read a hook payload on stdin, decide on stdout\n\
-         check '<command>'                     dry-run a Bash command through the rules\n\
-         validate                              report problems in every config source\n\
-         init                                  write a starter global config\n\
-         -v, --version                         print the version"
-    );
-    2
-}
-
-fn check(args: &[String]) -> Result<i32> {
-    let command = args.join(" ");
-    if command.trim().is_empty() {
-        bail!("check requires a command, e.g. steer check 'grep -rn foo src'");
-    }
-    let cwd = std::env::current_dir()?;
-    let ruleset = config::load(&cwd)?;
-    let tool_input = json!({ "command": command });
-
-    println!("command  {command}");
-    println!("cwd      {}", cwd.display());
-    println!("segments");
-    for segment in shell::lex(&command) {
-        let wrappers = if segment.wrappers.is_empty() {
-            String::new()
-        } else {
-            format!("  wrappers={:?}", segment.wrappers)
-        };
-        println!(
-            "  head={} args={:?} pipeline_start={} in_workspace={} depth={}{wrappers}",
-            segment.head,
-            segment.args,
-            segment.pipeline_start,
-            rules::in_workspace(&cwd, &segment.args),
-            segment.depth
-        );
-    }
-
-    let decision = rules::evaluate(&ruleset, "Bash", &tool_input, Some(&cwd));
-    println!(
-        "matched  {}",
-        if decision.fired.is_empty() {
-            "-".to_string()
-        } else {
-            decision.fired.join(", ")
-        }
-    );
-    for (name, why) in &decision.skipped {
-        println!("held     {name}: {why}");
-    }
-    println!("action   {}", decision.outcome.as_str());
-    if let Some(command) = &decision.updated_command {
-        println!("rewrite  {command}");
-    }
-    if !decision.message.is_empty() {
-        println!("message");
-        for line in decision.message.lines() {
-            println!("  {line}");
-        }
-    }
-    Ok(if decision.outcome == Outcome::Deny {
-        1
-    } else {
-        0
-    })
-}
-
-fn validate() -> Result<i32> {
-    let cwd = std::env::current_dir()?;
-    for source in config::sources(&cwd)? {
-        println!("source   {}", source.label);
-    }
-    let problems = config::validate(&cwd)?;
-    for problem in &problems {
-        println!("problem  {}: {}", problem.location, problem.detail);
-    }
-    if problems.is_empty() {
-        let count = config::load(&cwd)?.len();
-        println!("ok       {count} rules");
-        return Ok(0);
-    }
-    Ok(1)
-}
-
-fn init() -> Result<i32> {
-    let path = config::global_path().context("neither XDG_CONFIG_HOME nor HOME is set")?;
-    config::init(&path)?;
-    println!("wrote {}", path.display());
-    Ok(0)
 }

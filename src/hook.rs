@@ -1,5 +1,6 @@
-// The Claude Code hook boundary: payload in on stdin, `hookSpecificOutput` out
-// on stdout.
+// The hook boundary: payload in on stdin, `hookSpecificOutput` out on stdout.
+// Claude Code and Codex speak close enough to the same protocol to share it;
+// where they differ, the agent decides.
 //
 // Nothing here is allowed to block a tool call it did not mean to block. Every
 // failure path — unreadable stdin, malformed JSON, a broken config, a panic
@@ -8,16 +9,18 @@
 // debug it.
 //
 // `additionalContext` and `systemMessage` are nested inside `hookSpecificOutput`
-// on purpose; at the top level Claude Code drops them silently.
+// on purpose; at the top level Claude Code drops them silently. Codex documents
+// the opposite placement, so the breakage path writes both — it also runs before
+// the agent is known.
 
 use crate::log;
 use crate::rules::{self, Decision, Outcome};
-use crate::{config, Event};
+use crate::{config, Agent, Event};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Payload {
@@ -32,10 +35,33 @@ pub struct Payload {
     /// Undocumented but present for subagent calls; logged when it shows up.
     #[serde(default)]
     pub agent_type: Option<String>,
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
 }
 
-pub fn run(event: Event) -> i32 {
-    match decide(event) {
+/// Claude Code keeps transcripts under `~/.claude/projects/` and Codex under
+/// `~/.codex/sessions/`; failing that, `turn_id` is documented on Codex
+/// turn-scoped events and has no Claude Code equivalent. `None` rather than a
+/// default, because the wrong ruleset fails silently inside the model's context.
+pub fn detect(payload: &Payload) -> Option<Agent> {
+    // Components rather than a substring, so a checkout at
+    // `~/src/.claude-experiments` is not a signal.
+    let from_transcript = payload.transcript_path.as_ref().and_then(|path| {
+        Path::new(path)
+            .components()
+            .find_map(|component| match component.as_os_str().to_str() {
+                Some(".codex") => Some(Agent::Codex),
+                Some(".claude") => Some(Agent::Claude),
+                _ => None,
+            })
+    });
+    from_transcript.or_else(|| payload.turn_id.is_some().then_some(Agent::Codex))
+}
+
+pub fn run(event: Event, agent: Option<Agent>) -> i32 {
+    match decide(event, agent) {
         Ok(output) => {
             if let Some(output) = output {
                 println!("{output}");
@@ -50,6 +76,7 @@ pub fn run(event: Event) -> i32 {
 
 pub fn breakage(event: Event, message: &str) -> String {
     json!({
+        "systemMessage": message,
         "hookSpecificOutput": {
             "hookEventName": event.as_str(),
             "systemMessage": message,
@@ -58,12 +85,15 @@ pub fn breakage(event: Event, message: &str) -> String {
     .to_string()
 }
 
-fn decide(event: Event) -> Result<Option<String>> {
+fn decide(event: Event, flag: Option<Agent>) -> Result<Option<String>> {
     let mut raw = String::new();
     std::io::stdin()
         .read_to_string(&mut raw)
         .context("reading the hook payload from stdin")?;
     let payload: Payload = serde_json::from_str(&raw).context("parsing the hook payload")?;
+    let agent = flag
+        .or_else(|| detect(&payload))
+        .context("cannot tell which harness sent this payload; pass --agent claude|codex")?;
 
     // The payload's cwd is the session's, and the only thing that can say where
     // the workspace is; a rule that needs it declines when it is missing. Config
@@ -82,15 +112,26 @@ fn decide(event: Event) -> Result<Option<String>> {
     if event == Event::PostToolUse {
         ruleset.retain(|rule| matches!(rule.spec.action, rules::Action::Context { .. }));
     }
+    ruleset.retain(|rule| rule.spec.allows(agent));
 
-    let decision = rules::evaluate(&ruleset, &tool_name, &tool_input, workspace.as_deref());
-    if decision.outcome != Outcome::Allow {
-        log::record(event, &payload, &tool_name, &tool_input, &decision);
+    let decision = rules::evaluate(
+        &ruleset,
+        &tool_name,
+        &tool_input,
+        workspace.as_deref(),
+        Some(agent),
+    );
+    // An allowed Bash call is the other half of a deny: a rule the model worked
+    // around is only visible next to the command it ran instead. Allowed calls
+    // to other tools stay unlogged, which keeps Edit and Write payloads — whole
+    // file contents — off disk.
+    if decision.outcome != Outcome::Allow || tool_name == "Bash" {
+        log::record(event, agent, &payload, &tool_name, &tool_input, &decision);
     }
-    Ok(render(event, &tool_input, &decision))
+    Ok(render(event, agent, &tool_input, &decision))
 }
 
-fn render(event: Event, tool_input: &Value, decision: &Decision) -> Option<String> {
+fn render(event: Event, agent: Agent, tool_input: &Value, decision: &Decision) -> Option<String> {
     let mut fields = Map::new();
     fields.insert("hookEventName".into(), json!(event.as_str()));
 
@@ -104,15 +145,33 @@ fn render(event: Event, tool_input: &Value, decision: &Decision) -> Option<Strin
         }
         Outcome::Rewrite => {
             let command = decision.updated_command.clone()?;
-            let mut updated = tool_input.clone();
-            updated
-                .as_object_mut()?
-                .insert("command".into(), json!(command));
-            // No `permissionDecision` alongside it: force-approving here would
-            // route a rewritten command around the permission classifier.
-            fields.insert("updatedInput".into(), updated);
-            if !decision.message.is_empty() {
-                fields.insert("systemMessage".into(), json!(decision.message));
+            match agent {
+                Agent::Claude => {
+                    let mut updated = tool_input.clone();
+                    updated
+                        .as_object_mut()?
+                        .insert("command".into(), json!(command));
+                    // No `permissionDecision` alongside it: force-approving
+                    // here would route a rewritten command around the
+                    // permission classifier.
+                    fields.insert("updatedInput".into(), updated);
+                    if !decision.message.is_empty() {
+                        fields.insert("systemMessage".into(), json!(decision.message));
+                    }
+                }
+                // Codex accepts `updatedInput` only together with an approval,
+                // and its `ask` decision is unimplemented, so there is no way
+                // to edit the call and still route it through the user.
+                Agent::Codex => {
+                    let guidance = format!("Run this instead:\n\n  {command}");
+                    let reason = if decision.message.is_empty() {
+                        guidance
+                    } else {
+                        format!("{}\n\n{guidance}", decision.message)
+                    };
+                    fields.insert("permissionDecision".into(), json!("deny"));
+                    fields.insert("permissionDecisionReason".into(), json!(reason));
+                }
             }
         }
         Outcome::Context => {

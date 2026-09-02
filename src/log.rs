@@ -1,13 +1,13 @@
-// Append-only JSON-lines record of everything steer acted on, so a surprising
-// deny can be traced back to the rule that produced it without re-running the
-// session.
+// Append-only JSON-lines record of everything steer acted on, plus every Bash
+// call it allowed, so a surprising deny can be traced back to the rule that
+// produced it without re-running the session.
 //
 // A write failure is swallowed: losing a log line is not a reason to interfere
 // with a tool call.
 
 use crate::hook::Payload;
 use crate::rules::Decision;
-use crate::Event;
+use crate::{Agent, Event};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::PathBuf;
@@ -25,6 +25,7 @@ pub fn path() -> Option<PathBuf> {
 
 pub fn record(
     event: Event,
+    agent: Agent,
     payload: &Payload,
     tool_name: &str,
     tool_input: &Value,
@@ -41,6 +42,8 @@ pub fn record(
         "tool_name": tool_name,
         "tool_input": tool_input,
         "agent_type": payload.agent_type,
+        // The harness; `agent_type` is the subagent profile, a different axis.
+        "harness": agent.as_str(),
         "session_id": payload.session_id,
         "cwd": payload.cwd,
         "updated_command": decision.updated_command,

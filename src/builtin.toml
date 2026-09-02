@@ -18,6 +18,7 @@
 name = "fff-over-grep"
 description = "Shell searches over indexed paths belong to the fff MCP tools."
 tool = "Bash"
+agents = ["claude"]
 
 [[rules.match]]
 any = "parsed.segments"
@@ -63,6 +64,12 @@ They are frecency-ranked and index-aware. A shell search after a pipe, one \
 that lands outside this workspace or under node_modules, and a `find` that \
 acts on what it finds (`-delete`, `-exec`) are all still fine."""
 
+# Relative paths only: an absolute one outside the tree would flip to
+# in-workspace for whoever runs validate from `/`.
+[rules.test]
+fires = ["grep -rn foo src", "git grep -n RecordStore", "find . -name '*.tsx'"]
+ignores = ["gh pr list | grep foo", "find . -name '*.log' -delete", "rg -n lib node_modules/@scope"]
+
 # A file read wearing a stream editor's clothes, and its whole family. Blocking
 # one spelling only moves the intent to the next: denied `sed -n`, a model
 # reaches for `cat -n`, then `cat file | head -120`, then `awk 'NR>=655 &&
@@ -78,6 +85,7 @@ acts on what it finds (`-delete`, `-exec`) are all still fine."""
 name = "read-over-shell-pager"
 description = "Shell file reads and line-range pagers belong to the Read tool."
 tool = "Bash"
+agents = ["claude"]
 
 [[rules.match]]
 any = "parsed.segments"
@@ -116,6 +124,10 @@ formatter — redirect it instead of catting it: `jq . < data.json`, not \
 Escapes: any of these after a pipe is a filter on output that already exists \
 and is fine, as is `tail -f`, and so is a file outside this workspace."""
 
+[rules.test]
+fires = ["sed -n 800,900p src/rules.rs", "cat README.md", "awk 'NR>=10 && NR<=20' src/main.rs"]
+ignores = ["jq . < data.json", "tail -f server.log", "go test ./... | head -20"]
+
 # Same failure class as the pager rule: a shell command standing in for a
 # dedicated tool. A whole program written inline to stdin is nearly always file
 # surgery, and it arrives unreviewable — the edit is invisible until it has
@@ -131,7 +143,7 @@ and is fine, as is `tail -f`, and so is a file outside this workspace."""
 # which is how "took no arguments" is expressed here.
 [[rules]]
 name = "edit-over-python"
-description = "Inline Python programs fed to stdin belong to the Edit and Write tools."
+description = "Inline Python programs fed to stdin belong to a real edit tool."
 tool = "Bash"
 
 [[rules.match]]
@@ -146,9 +158,13 @@ head = { any_of = ["python", "python3"] }
 args = { none_glob = ["*"] }
 pipeline_start = { is = true }
 
+# The only built-in that reaches both harnesses. The offense is identical under
+# either, an unreviewable edit arriving as a program, so only the tool name differs.
 [rules.action]
 kind = "deny"
-message = """
+
+[rules.action.message]
+claude = """
 Use the Edit tool to change a file and the Write tool to create one. Both show \
 the change in the transcript, and Edit fails loudly when the text it was told \
 to replace is not there, rather than writing something unintended.
@@ -156,6 +172,19 @@ to replace is not there, rather than writing something unintended.
 Two escapes. `python3 -c` for a short computation is fine, and so is a real \
 script written to a file and then run. `cat data.json | python3 -` is a filter \
 being fed data, not a program editing files, and is fine too."""
+codex = """
+Use `apply_patch` to edit a file. It shows the change as a patch and fails when \
+the context it was given does not match, rather than writing something \
+unintended — which is also what your own instructions ask for, over editing \
+files with shell write tricks.
+
+Two escapes. `python3 -c` for a short computation is fine, and so is a real \
+script written to a file and then run. `cat data.json | python3 -` is a filter \
+being fed data, not a program editing files, and is fine too."""
+
+[rules.test]
+fires = ["python3 - <<'PY'", "python3 <<'PY'"]
+ignores = ["python3 -c 'print(1)'", "python3 scripts/build.py", "cat data.json | python3 -"]
 
 # Same-tool correction, so it happens silently. The engine holds it back
 # wherever `trash` is missing from PATH, which is every Linux VM.
@@ -172,4 +201,10 @@ head = { any_of = ["rm"] }
 kind = "rewrite"
 replace_head = "trash"
 drop_args = ["-r", "-R", "-f", "-rf", "-fr", "-Rf", "-fR", "-rF", "--recursive", "--force"]
-message = "steer: rewrote `rm` to `trash` so the delete stays recoverable."
+message = "steer: `rm` becomes `trash` so the delete stays recoverable."
+
+# The splice is the whole rule, so the examples pin what it produces rather
+# than only that it happened.
+[rules.test]
+ignores = ["trash dist", "git rm --cached secrets.env"]
+rewrites = { "rm -rf dist" = "trash dist", "cd build && rm -f out.o" = "cd build && trash out.o", "rm -rf a b && echo done" = "trash a b && echo done" }

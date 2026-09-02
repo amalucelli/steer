@@ -1,453 +1,40 @@
 // The predicate language and the engine that runs it.
 //
-// One vocabulary matches every tool. A rule addresses `file_path` on an Edit
-// payload and `parsed.segments[].head` on a Bash one through the same path
-// syntax, because shell awareness is a pre-processing step that hangs a
-// `parsed` object off the payload rather than a second config dialect.
+// A tool call arrives, and this module answers with one decision. Getting there
+// takes four steps, each of which owns a file: `spec` is the rule as its config
+// writes it, `compile` turns that into something that can be asked a question,
+// `document` projects the payload into what the predicates read, and `rewrite`
+// edits the command line where a rule says to. `trace` is the fifth and answers
+// a different question — not what happened, but why.
 //
-// Two shapes carry most of the design:
+// Two shapes carry most of the design. The first belongs to `compile`: blocks
+// are OR'd and the conditions inside one are AND'd against a single binding,
+// which is what makes correlation across pipeline segments impossible by
+// construction.
 //
-// A rule's `[[rules.match]]` blocks are OR'd, and the conditions inside one
-// block are AND'd against a single binding. That matters for correlation: a
-// block bound with `any = "parsed.segments"` asks whether *one* segment
-// satisfies every condition, so `cd /repo && grep foo` cannot pass by having
-// one segment supply the head and another supply the pipeline position.
-//
-// A rewrite is gated on its replacement binary existing, in the engine rather
-// than per rule. `trash` is absent from the Linux VMs, and a `trash-over-rm`
-// rewrite that fired there would turn every delete into a missing command.
+// The second is here. A rewrite is gated on its replacement binary existing, in
+// the engine rather than per rule. `trash` is absent from the Linux VMs, and a
+// `trash-over-rm` rewrite that fired there would turn every delete into a
+// missing command.
 
-use crate::shell::{self, Segment, Span};
-use anyhow::{bail, Context, Result};
-use globset::{Glob, GlobSet, GlobSetBuilder};
-use regex::Regex;
-use serde::Deserialize;
+mod compile;
+mod document;
+mod rewrite;
+mod spec;
+mod trace;
+
+pub use compile::Rule;
+pub use document::in_workspace;
+pub use rewrite::on_path;
+pub use spec::{Action, MatchBlock, Message, Outcome, Predicate, RuleSpec, TestSpec};
+pub use trace::{trace, trace_at, Checked, Trace};
+
+use crate::shell;
+use crate::Agent;
+use document::{document, enrich};
+use rewrite::splice;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RuleSpec {
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    /// Exact `tool_name` gate. Absent means the rule sees every tool.
-    #[serde(default)]
-    pub tool: Option<String>,
-    #[serde(rename = "match", default)]
-    pub blocks: Vec<MatchBlock>,
-    pub action: Action,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct MatchBlock {
-    /// Path to an array; the block holds when some element satisfies it.
-    #[serde(default)]
-    pub any: Option<String>,
-    /// Path to an array; the block holds when every element satisfies it, and
-    /// an empty array never satisfies it.
-    #[serde(default)]
-    pub all: Option<String>,
-    #[serde(flatten)]
-    pub conditions: BTreeMap<String, Predicate>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Predicate {
-    pub any_of: Option<Vec<String>>,
-    pub none_of: Option<Vec<String>>,
-    pub glob: Option<Vec<String>>,
-    pub none_glob: Option<Vec<String>>,
-    pub matches: Option<String>,
-    pub is: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
-pub enum Action {
-    Deny {
-        message: String,
-    },
-    Rewrite {
-        /// Binary that replaces the matched segment's head.
-        replace_head: String,
-        /// Arguments dropped from the matched segment, matched exactly.
-        #[serde(default)]
-        drop_args: Vec<String>,
-        #[serde(default)]
-        message: String,
-    },
-    Context {
-        message: String,
-    },
-}
-
-impl Action {
-    fn outcome(&self) -> Outcome {
-        match self {
-            Action::Deny { .. } => Outcome::Deny,
-            Action::Rewrite { .. } => Outcome::Rewrite,
-            Action::Context { .. } => Outcome::Context,
-        }
-    }
-
-    fn message(&self) -> &str {
-        match self {
-            Action::Deny { message } | Action::Context { message } => message,
-            Action::Rewrite { message, .. } => message,
-        }
-    }
-}
-
-/// A rule with its globs and regexes compiled once at load.
-pub struct Rule {
-    pub spec: RuleSpec,
-    blocks: Vec<CompiledBlock>,
-}
-
-struct CompiledBlock {
-    binding: Binding,
-    conditions: Vec<(Vec<PathPart>, CompiledPredicate)>,
-}
-
-enum Binding {
-    Root,
-    Any(Vec<PathPart>),
-    All(Vec<PathPart>),
-}
-
-#[derive(Default)]
-struct CompiledPredicate {
-    any_of: Option<Vec<String>>,
-    none_of: Option<Vec<String>>,
-    glob: Option<GlobSet>,
-    none_glob: Option<GlobSet>,
-    matches: Option<Regex>,
-    is: Option<bool>,
-}
-
-enum PathPart {
-    Key(String),
-    Index(usize),
-}
-
-fn parse_path(path: &str) -> Vec<PathPart> {
-    path.split('.')
-        .filter(|p| !p.is_empty())
-        .map(|p| match p.parse::<usize>() {
-            Ok(n) => PathPart::Index(n),
-            Err(_) => PathPart::Key(p.to_string()),
-        })
-        .collect()
-}
-
-fn resolve<'a>(value: &'a Value, path: &[PathPart]) -> Option<&'a Value> {
-    let mut cur = value;
-    for part in path {
-        cur = match part {
-            PathPart::Key(k) => cur.get(k)?,
-            PathPart::Index(i) => cur.get(i)?,
-        };
-    }
-    Some(cur)
-}
-
-fn build_globs(patterns: &[String], rule: &str, path: &str) -> Result<GlobSet> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        builder.add(
-            Glob::new(pattern)
-                .with_context(|| format!("rule `{rule}`: bad glob `{pattern}` at `{path}`"))?,
-        );
-    }
-    builder.build().map_err(Into::into)
-}
-
-impl Rule {
-    pub fn compile(spec: RuleSpec) -> Result<Rule> {
-        if spec.name.trim().is_empty() {
-            bail!("a rule is missing a name");
-        }
-        if spec.blocks.is_empty() {
-            bail!("rule `{}` has no [[rules.match]] block", spec.name);
-        }
-        let mut blocks = Vec::with_capacity(spec.blocks.len());
-        for block in &spec.blocks {
-            let binding = match (&block.any, &block.all) {
-                (Some(_), Some(_)) => {
-                    bail!("rule `{}`: a match block sets both any and all", spec.name)
-                }
-                (Some(p), None) => Binding::Any(parse_path(p)),
-                (None, Some(p)) => Binding::All(parse_path(p)),
-                (None, None) => Binding::Root,
-            };
-            if block.conditions.is_empty() {
-                bail!("rule `{}`: a match block has no conditions", spec.name);
-            }
-            let mut conditions = Vec::with_capacity(block.conditions.len());
-            for (path, pred) in &block.conditions {
-                if pred == &Predicate::default() {
-                    bail!("rule `{}`: condition `{path}` has no operator", spec.name);
-                }
-                let compiled = CompiledPredicate {
-                    any_of: pred.any_of.clone(),
-                    none_of: pred.none_of.clone(),
-                    glob: pred
-                        .glob
-                        .as_ref()
-                        .map(|g| build_globs(g, &spec.name, path))
-                        .transpose()?,
-                    none_glob: pred
-                        .none_glob
-                        .as_ref()
-                        .map(|g| build_globs(g, &spec.name, path))
-                        .transpose()?,
-                    matches: pred
-                        .matches
-                        .as_ref()
-                        .map(|r| {
-                            Regex::new(r).with_context(|| {
-                                format!("rule `{}`: bad regex `{r}` at `{path}`", spec.name)
-                            })
-                        })
-                        .transpose()?,
-                    is: pred.is,
-                };
-                conditions.push((parse_path(path), compiled));
-            }
-            blocks.push(CompiledBlock {
-                binding,
-                conditions,
-            });
-        }
-        Ok(Rule { spec, blocks })
-    }
-
-    fn block_holds(block: &CompiledBlock, binding: &Value) -> bool {
-        block
-            .conditions
-            .iter()
-            .all(|(path, pred)| pred.holds(resolve(binding, path)))
-    }
-
-    /// Element indices of `parsed.segments` that satisfy a whole block, which
-    /// is what a rewrite needs in order to know where to splice.
-    fn matching_segments(&self, doc: &Value) -> Vec<usize> {
-        let mut hits = Vec::new();
-        for block in &self.blocks {
-            let Binding::Any(path) = &block.binding else {
-                continue;
-            };
-            let Some(Value::Array(items)) = resolve(doc, path) else {
-                continue;
-            };
-            for (i, item) in items.iter().enumerate() {
-                if Self::block_holds(block, item) && !hits.contains(&i) {
-                    hits.push(i);
-                }
-            }
-        }
-        hits.sort_unstable();
-        hits
-    }
-
-    fn matches(&self, doc: &Value) -> bool {
-        if let Some(tool) = &self.spec.tool {
-            if doc.get("tool_name").and_then(Value::as_str) != Some(tool.as_str()) {
-                return false;
-            }
-        }
-        self.blocks.iter().any(|block| match &block.binding {
-            Binding::Root => Self::block_holds(block, doc),
-            Binding::Any(path) => match resolve(doc, path) {
-                Some(Value::Array(items)) => {
-                    items.iter().any(|item| Self::block_holds(block, item))
-                }
-                _ => false,
-            },
-            Binding::All(path) => match resolve(doc, path) {
-                Some(Value::Array(items)) => {
-                    !items.is_empty() && items.iter().all(|item| Self::block_holds(block, item))
-                }
-                _ => false,
-            },
-        })
-    }
-}
-
-impl CompiledPredicate {
-    /// A missing path fails the positive operators and passes the negative
-    /// ones: nothing is there to match, and nothing is there to violate.
-    fn holds(&self, value: Option<&Value>) -> bool {
-        if let Some(expected) = self.is {
-            if value.and_then(Value::as_bool) != Some(expected) {
-                return false;
-            }
-        }
-        let candidates = candidates(value);
-        if let Some(list) = &self.any_of {
-            if !candidates.iter().any(|c| list.iter().any(|w| w == c)) {
-                return false;
-            }
-        }
-        if let Some(list) = &self.none_of {
-            if candidates.iter().any(|c| list.iter().any(|w| w == c)) {
-                return false;
-            }
-        }
-        if let Some(set) = &self.glob {
-            if !candidates.iter().any(|c| set.is_match(c)) {
-                return false;
-            }
-        }
-        if let Some(set) = &self.none_glob {
-            if candidates.iter().any(|c| set.is_match(c)) {
-                return false;
-            }
-        }
-        if let Some(re) = &self.matches {
-            if !candidates.iter().any(|c| re.is_match(c)) {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-/// A string value contributes itself; an array contributes each of its string
-/// elements, so `args` and `file_path` read the same way.
-fn candidates(value: Option<&Value>) -> Vec<&str> {
-    match value {
-        Some(Value::String(s)) => vec![s.as_str()],
-        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// Projects the payload into the document rules match against. The segments
-/// come in already lexed so that one shell parse serves both matching and the
-/// spans a rewrite splices with.
-fn enrich(tool_name: &str, tool_input: &Value, segments: &[Segment], cwd: Option<&Path>) -> Value {
-    let mut doc = tool_input.as_object().cloned().unwrap_or_default();
-    doc.insert("tool_name".into(), json!(tool_name));
-    doc.insert(
-        "parsed".into(),
-        json!({ "segments": segment_docs(segments, cwd) }),
-    );
-    Value::Object(doc)
-}
-
-fn segment_docs(segments: &[Segment], cwd: Option<&Path>) -> Vec<Value> {
-    segments
-        .iter()
-        .map(|s| {
-            let mut doc = json!({
-                "head": s.head,
-                "args": s.args,
-                "pipeline_start": s.pipeline_start,
-                "depth": s.depth,
-                "wrappers": s.wrappers,
-            });
-            // Left out entirely when there is no cwd to resolve against, so a
-            // rule asking for it declines rather than guessing.
-            if let (Some(cwd), Some(fields)) = (cwd, doc.as_object_mut()) {
-                fields.insert("in_workspace".into(), json!(in_workspace(cwd, &s.args)));
-            }
-            doc
-        })
-        .collect()
-}
-
-/// Whether a segment reaches into the session's working tree.
-///
-/// "Outside the workspace" is a question about where a path lands, not how it
-/// is spelled. An absolute path into the workspace is the same search as the
-/// relative one, and Claude Code writes absolute paths constantly — testing for
-/// a leading slash lets most real searches through.
-///
-/// A command with no path argument works on the current directory, which is
-/// the workspace by definition.
-pub fn in_workspace(cwd: &Path, args: &[String]) -> bool {
-    let workspace = normalize(cwd);
-    let mut saw_path = false;
-    for arg in args.iter().filter(|a| path_shaped(a)) {
-        saw_path = true;
-        if let Some(resolved) = resolve_arg(&workspace, arg) {
-            if resolved.starts_with(&workspace) {
-                return true;
-            }
-        }
-    }
-    !saw_path
-}
-
-/// Arguments that name a location rather than a pattern or a flag. Glob and
-/// regex metacharacters rule a token out: `*chat*` and `func .*Conv` are what
-/// the command is looking for, not where.
-fn path_shaped(arg: &str) -> bool {
-    if arg.is_empty() || arg.starts_with('-') || arg.contains("://") {
-        return false;
-    }
-    if arg.contains(['*', '?', '[', ']', '(', ')', '|', '^', '$', '\\']) {
-        return false;
-    }
-    arg == "." || arg == ".." || arg.starts_with('~') || arg.contains('/')
-}
-
-/// Resolves lexically and never touches the disk: a search over a directory
-/// that does not exist yet still has a location.
-fn resolve_arg(cwd: &Path, arg: &str) -> Option<PathBuf> {
-    let expanded = if arg == "~" {
-        PathBuf::from(std::env::var_os("HOME")?)
-    } else if let Some(rest) = arg.strip_prefix("~/") {
-        PathBuf::from(std::env::var_os("HOME")?).join(rest)
-    } else if arg.starts_with('~') {
-        // `~user` is another account's home and not ours to guess at.
-        return None;
-    } else {
-        PathBuf::from(arg)
-    };
-    Some(normalize(&if expanded.is_absolute() {
-        expanded
-    } else {
-        cwd.join(expanded)
-    }))
-}
-
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Outcome {
-    Allow,
-    Context,
-    Rewrite,
-    Deny,
-}
-
-impl Outcome {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Outcome::Allow => "allow",
-            Outcome::Context => "context",
-            Outcome::Rewrite => "rewrite",
-            Outcome::Deny => "deny",
-        }
-    }
-}
+use std::path::Path;
 
 pub struct Decision {
     pub outcome: Outcome,
@@ -467,17 +54,13 @@ pub fn evaluate(
     tool_name: &str,
     tool_input: &Value,
     cwd: Option<&Path>,
+    agent: Option<Agent>,
 ) -> Decision {
     let command = tool_input
         .get("command")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let segments = if tool_name == "Bash" {
-        shell::lex(command)
-    } else {
-        Vec::new()
-    };
-    let doc = enrich(tool_name, tool_input, &segments, cwd);
+    let (segments, doc) = document(tool_name, tool_input, cwd);
 
     let mut fired: Vec<&Rule> = Vec::new();
     let mut skipped = Vec::new();
@@ -490,14 +73,16 @@ pub fn evaluate(
             Action::Rewrite {
                 replace_head,
                 drop_args,
+                add_args,
                 ..
             } => {
-                if !on_path(replace_head) {
-                    skipped.push((
-                        rule.spec.name.clone(),
-                        format!("`{replace_head}` is not on PATH"),
-                    ));
-                    continue;
+                // Only a head replacement names a binary; an argument-only
+                // rewrite has nothing to look up.
+                if let Some(head) = replace_head {
+                    if !on_path(head) {
+                        skipped.push((rule.spec.name.clone(), format!("`{head}` is not on PATH")));
+                        continue;
+                    }
                 }
                 // An unclosed heredoc leaves steer guessing where a command
                 // ends and body text begins. Bash still runs such a line — it
@@ -515,7 +100,14 @@ pub fn evaluate(
                 // A rule that matches but cannot be spliced has not fired, and
                 // must not contribute its reason to the message either.
                 let hits = rule.matching_segments(&doc);
-                match splice(command, &segments, &hits, replace_head, drop_args) {
+                match splice(
+                    command,
+                    &segments,
+                    &hits,
+                    replace_head.as_deref(),
+                    drop_args,
+                    add_args,
+                ) {
                     Some(_) => fired.push(rule),
                     None => skipped.push((
                         rule.spec.name.clone(),
@@ -544,7 +136,7 @@ pub fn evaluate(
     // story rather than only the rule that happened to win.
     let message = fired
         .iter()
-        .map(|rule| rule.spec.action.message().trim())
+        .map(|rule| rule.spec.action.message().text(agent).trim().to_string())
         .filter(|m| !m.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
@@ -559,6 +151,7 @@ pub fn evaluate(
             let Action::Rewrite {
                 replace_head,
                 drop_args,
+                add_args,
                 ..
             } = &rule.spec.action
             else {
@@ -570,7 +163,14 @@ pub fn evaluate(
             let segments = shell::lex(&current);
             let doc = enrich(tool_name, &input, &segments, cwd);
             let hits = rule.matching_segments(&doc);
-            if let Some(next) = splice(&current, &segments, &hits, replace_head, drop_args) {
+            if let Some(next) = splice(
+                &current,
+                &segments,
+                &hits,
+                replace_head.as_deref(),
+                drop_args,
+                add_args,
+            ) {
                 current = next;
             }
         }
@@ -583,208 +183,5 @@ pub fn evaluate(
         updated_command,
         fired: fired.iter().map(|r| r.spec.name.clone()).collect(),
         skipped,
-    }
-}
-
-/// Replaces each matched segment's head in place and deletes the dropped
-/// arguments, editing the original string so untouched text survives verbatim.
-fn splice(
-    command: &str,
-    segments: &[Segment],
-    hits: &[usize],
-    replace_head: &str,
-    drop_args: &[String],
-) -> Option<String> {
-    let mut edits: Vec<(Span, &str)> = Vec::new();
-    for &i in hits {
-        let segment = segments.get(i)?;
-        let head_span = segment.head_span?;
-        edits.push((head_span, replace_head));
-        for (arg, span) in segment.args.iter().zip(&segment.arg_spans) {
-            if drop_args.iter().any(|d| d == arg) {
-                edits.push(((*span)?, ""));
-            }
-        }
-    }
-    if edits.is_empty() {
-        return None;
-    }
-    edits.sort_by_key(|(span, _)| span.start);
-
-    let bytes = command.as_bytes();
-    let mut out = String::with_capacity(command.len());
-    let mut cursor = 0;
-    for (span, replacement) in edits {
-        let mut start = span.start;
-        // A deletion takes its leading whitespace with it, so removing `-rf`
-        // does not leave a double space behind.
-        if replacement.is_empty() {
-            while start > cursor && matches!(bytes[start - 1], b' ' | b'\t') {
-                start -= 1;
-            }
-        }
-        if start < cursor {
-            continue;
-        }
-        out.push_str(&command[cursor..start]);
-        out.push_str(replacement);
-        cursor = span.end;
-    }
-    out.push_str(&command[cursor..]);
-    Some(out)
-}
-
-/// Direct PATH scan rather than a `which` subprocess; the hook runs on every
-/// tool call and a fork would dominate its budget.
-fn on_path(binary: &str) -> bool {
-    if binary.contains('/') {
-        return is_executable(Path::new(binary));
-    }
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| is_executable(&dir.join(binary)))
-}
-
-fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn rule(toml_src: &str) -> Rule {
-        #[derive(Deserialize)]
-        struct Wrapper {
-            rules: Vec<RuleSpec>,
-        }
-        let w: Wrapper = toml::from_str(toml_src).expect("parse");
-        Rule::compile(w.rules.into_iter().next().unwrap()).expect("compile")
-    }
-
-    const GREP: &str = r#"
-[[rules]]
-name = "t"
-tool = "Bash"
-[[rules.match]]
-any = "parsed.segments"
-head = { any_of = ["grep"] }
-pipeline_start = { is = true }
-[rules.action]
-kind = "deny"
-message = "no"
-"#;
-
-    fn bash(cmd: &str) -> Value {
-        json!({ "command": cmd })
-    }
-
-    fn doc(tool_name: &str, tool_input: &Value) -> Value {
-        let command = tool_input
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        enrich(
-            tool_name,
-            tool_input,
-            &shell::lex(command),
-            Some(Path::new("/workspace")),
-        )
-    }
-
-    #[test]
-    fn workspace_membership_follows_where_a_path_lands() {
-        let w = Path::new("/workspace");
-        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-
-        assert!(in_workspace(w, &args(&["-rn", "X", "/workspace/pkg/go"])));
-        assert!(in_workspace(w, &args(&["-rn", "X", "pkg/go"])));
-        assert!(in_workspace(w, &args(&["-rn", "X"])), "no path arg is cwd");
-        assert!(in_workspace(w, &args(&["-rn", "X", "."])));
-        assert!(in_workspace(w, &args(&["-rn", "X", "sub/../pkg"])));
-
-        assert!(!in_workspace(w, &args(&["-rn", "X", "/usr/local/include"])));
-        assert!(!in_workspace(w, &args(&["-rn", "X", "../elsewhere/src"])));
-
-        // A pattern is not a location: metacharacters and URLs are ruled out,
-        // so they neither claim the workspace nor escape it.
-        assert!(!path_shaped("*chat*"));
-        assert!(!path_shaped("func .*Conv"));
-        assert!(!path_shaped("https://example.com/x"));
-        assert!(!path_shaped("--include=*.go"));
-        assert!(path_shaped("pkg/go"));
-        assert!(path_shaped("."));
-    }
-
-    #[test]
-    fn conditions_in_a_block_bind_to_one_element() {
-        let r = rule(GREP);
-        assert!(r.matches(&doc("Bash", &bash("grep foo x"))));
-        // `gh` supplies the pipeline start and `grep` the head; neither segment
-        // satisfies both, so the block must not hold.
-        assert!(!r.matches(&doc("Bash", &bash("gh pr list | grep foo"))));
-    }
-
-    #[test]
-    fn tool_gate_is_exact() {
-        let r = rule(GREP);
-        assert!(!r.matches(&doc("Edit", &json!({ "file_path": "grep" }))));
-    }
-
-    #[test]
-    fn root_bound_block_reads_tool_input_directly() {
-        let r = rule(
-            r#"
-[[rules]]
-name = "t"
-[[rules.match]]
-file_path = { glob = ["*/secrets/*"] }
-[rules.action]
-kind = "context"
-message = "careful"
-"#,
-        );
-        assert!(r.matches(&doc("Edit", &json!({"file_path": "a/secrets/b"}))));
-        assert!(!r.matches(&doc("Edit", &json!({"file_path": "a/b"}))));
-    }
-
-    #[test]
-    fn missing_path_fails_positive_and_passes_negative() {
-        let pred = CompiledPredicate {
-            any_of: Some(vec!["x".into()]),
-            ..Default::default()
-        };
-        assert!(!pred.holds(None));
-        let pred = CompiledPredicate {
-            none_of: Some(vec!["x".into()]),
-            ..Default::default()
-        };
-        assert!(pred.holds(None));
-    }
-
-    #[test]
-    fn splice_replaces_head_and_drops_flags() {
-        let cmd = "cd x && rm -rf build node_modules";
-        let segments = shell::lex(cmd);
-        let out = splice(cmd, &segments, &[1], "trash", &["-rf".to_string()]).unwrap();
-        assert_eq!(out, "cd x && trash build node_modules");
-    }
-
-    #[test]
-    fn splice_declines_nested_text() {
-        let cmd = "bash -c 'rm -rf build'";
-        let segments = shell::lex(cmd);
-        assert!(splice(cmd, &segments, &[0], "trash", &[]).is_none());
     }
 }
