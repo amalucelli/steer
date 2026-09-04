@@ -13,21 +13,63 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const BUILTIN: &str = include_str!("builtin.toml");
+const BUILTIN_LABEL: &str = "built-in";
 const OVERLAY_NAME: &str = ".steer.toml";
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
+    /// Whether the compiled-in rules take part at all.
+    ///
+    /// A `disable` list names opinions you happen not to share; this says you
+    /// are not starting from these opinions. The difference matters across
+    /// releases — a list is complete only until the next built-in ships, and
+    /// then it silently is not.
+    #[serde(default = "yes")]
+    pub builtins: bool,
     /// Rule names switched off, whatever source defined them.
     #[serde(default)]
     pub disable: Vec<String>,
     #[serde(default)]
     pub rules: Vec<RuleSpec>,
+    #[serde(default)]
+    pub amend: Vec<Amendment>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Examples added to a rule someone else defined.
+///
+/// Redefining a rule to add an example means copying it whole, which pins it at
+/// the text that was copied — a later release improving that rule never reaches
+/// the config carrying the copy. An escape a person means to allow is a claim
+/// about the rule, not a new version of it, so it is written on its own.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Amendment {
+    pub name: String,
+    #[serde(default)]
+    pub fires: Vec<String>,
+    #[serde(default)]
+    pub ignores: Vec<String>,
+}
+
+/// One amendment as a config file spells it, for appending to one.
+pub fn amendment_toml(name: &str, ignores: &[String]) -> String {
+    let mut out = String::from("[[amend]]\n");
+    out.push_str(&format!("name = {}\n", string(name)));
+    out.push_str(&format!("ignores = {}\n", array(ignores)));
+    out
 }
 
 pub struct Source {
     pub label: String,
     pub text: String,
+    /// The compiled-in file, which `builtins = false` in any later source
+    /// takes out of the stack.
+    pub builtin: bool,
 }
 
 /// A rule written back out as TOML, in the shape the config files use. Whole
@@ -207,6 +249,31 @@ fn quoted(text: &str) -> String {
     out
 }
 
+fn ensure_parent(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))
+}
+
+/// Appends to a config file, creating it and its directory if neither is there.
+///
+/// An array-of-tables at the end of a file is the one edit that cannot disturb
+/// what is above it, which is why a declaration is written as one rather than
+/// spliced into a rule.
+pub fn append(path: &Path, text: &str) -> Result<()> {
+    ensure_parent(path)?;
+    let mut existing = std::fs::read_to_string(path).unwrap_or_default();
+    if !existing.is_empty() {
+        if !existing.ends_with('\n') {
+            existing.push('\n');
+        }
+        existing.push('\n');
+    }
+    existing.push_str(text);
+    std::fs::write(path, existing).with_context(|| format!("writing {}", path.display()))
+}
+
 pub fn global_path() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
@@ -223,8 +290,9 @@ pub fn overlay_path(cwd: &Path) -> Option<PathBuf> {
 
 pub fn sources(cwd: &Path) -> Result<Vec<Source>> {
     let mut sources = vec![Source {
-        label: "built-in".into(),
+        label: BUILTIN_LABEL.into(),
         text: BUILTIN.to_string(),
+        builtin: true,
     }];
     for path in [global_path(), overlay_path(cwd)].into_iter().flatten() {
         if !path.is_file() {
@@ -235,20 +303,62 @@ pub fn sources(cwd: &Path) -> Result<Vec<Source>> {
         sources.push(Source {
             label: path.display().to_string(),
             text,
+            builtin: false,
         });
     }
     Ok(sources)
 }
 
+/// A source and what it said, or why it said nothing. The failure travels with
+/// the source because only the caller knows whether an unreadable file is worth
+/// reporting or worth stopping for.
+type Parse = (Source, Result<ConfigFile, toml::de::Error>);
+
+/// Every source parsed once, and whether the built-ins take part at all.
+///
+/// The second answer arrives out of order: the built-ins come first and whether
+/// they take part is said after them, so it cannot be settled inside a walk over
+/// the sources. A source that does not parse cannot turn them off, and the
+/// caller that cares reports the parse failure on its own.
+fn parsed(cwd: &Path) -> Result<(Vec<Parse>, bool)> {
+    let files: Vec<Parse> = sources(cwd)?
+        .into_iter()
+        .map(|source| {
+            let file = toml::from_str(&source.text);
+            (source, file)
+        })
+        .collect();
+    let builtins = files
+        .iter()
+        .all(|(_, file)| file.as_ref().map_or(true, |file| file.builtins));
+    Ok((files, builtins))
+}
+
 pub fn load(cwd: &Path) -> Result<Vec<Rule>> {
     let mut specs: Vec<RuleSpec> = Vec::new();
     let mut disabled: Vec<String> = Vec::new();
+    let mut amendments: Vec<Amendment> = Vec::new();
 
-    for source in sources(cwd)? {
-        let file: ConfigFile =
-            toml::from_str(&source.text).with_context(|| format!("parsing {}", source.label))?;
+    let (files, builtins) = parsed(cwd)?;
+    for (source, file) in files {
+        let file = file.with_context(|| format!("parsing {}", source.label))?;
         disabled.extend(file.disable);
+        amendments.extend(file.amend);
+        // The built-in file still contributes its `disable` and `amend`, which
+        // are about rules rather than the source they came from — but it is
+        // written to carry neither, so this is only ever about the rules.
+        if source.builtin && !builtins {
+            continue;
+        }
         upsert(&mut specs, file.rules);
+    }
+    // After every source, so an amendment reaches the rule as it finally stands
+    // rather than whichever version happened to be loaded when it was read.
+    for amendment in amendments {
+        if let Some(spec) = specs.iter_mut().find(|spec| spec.name == amendment.name) {
+            spec.test.fires.extend(amendment.fires);
+            spec.test.ignores.extend(amendment.ignores);
+        }
     }
 
     specs.retain(|spec| !disabled.contains(&spec.name));
@@ -277,6 +387,8 @@ pub struct Layer {
     /// Absent when the source did not parse; the problem carries the detail.
     pub rules: Option<Vec<RuleSpec>>,
     pub disable: Vec<String>,
+    /// Declared, and taking no part: `builtins = false` somewhere downstream.
+    pub off: bool,
 }
 
 pub struct Report {
@@ -333,8 +445,10 @@ pub fn inspect(cwd: &Path) -> Result<Report> {
     // follow the definition that is actually live.
     let mut examples: BTreeMap<String, Vec<Example>> = BTreeMap::new();
 
-    for source in sources(cwd)? {
-        let file: ConfigFile = match toml::from_str(&source.text) {
+    let (files, builtins) = parsed(cwd)?;
+
+    for (source, file) in files {
+        let file = match file {
             Ok(file) => file,
             Err(err) => {
                 problems.push(Problem {
@@ -345,10 +459,22 @@ pub fn inspect(cwd: &Path) -> Result<Report> {
                     label: source.label.clone(),
                     rules: None,
                     disable: Vec::new(),
+                    off: false,
                 });
                 continue;
             }
         };
+        // Listed, so the report shows what was turned off rather than pretending
+        // it was never there — but contributing no rule and no example.
+        if source.builtin && !builtins {
+            layers.push(Layer {
+                label: source.label.clone(),
+                rules: Some(file.rules),
+                disable: file.disable,
+                off: true,
+            });
+            continue;
+        }
         // Cannot fail where the parse above succeeded: `Located` reads the
         // same file with a looser schema, purely to recover spans.
         let located: Located = toml::from_str(&source.text)?;
@@ -394,6 +520,7 @@ pub fn inspect(cwd: &Path) -> Result<Report> {
             label: source.label.clone(),
             rules: Some(file.rules.clone()),
             disable: file.disable,
+            off: false,
         });
         upsert(&mut specs, file.rules);
     }
@@ -488,10 +615,7 @@ pub fn init(path: &Path) -> Result<()> {
     if path.exists() {
         bail!("{} already exists", path.display());
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
+    ensure_parent(path)?;
     std::fs::write(path, STARTER).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
@@ -560,7 +684,7 @@ mod tests {
     #[test]
     fn builtins_compile() {
         let file: ConfigFile = toml::from_str(BUILTIN).expect("parse built-ins");
-        assert_eq!(file.rules.len(), 4);
+        assert_eq!(file.rules.len(), 5);
         for spec in file.rules {
             Rule::compile(spec).expect("compile built-in");
         }

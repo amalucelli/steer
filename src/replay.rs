@@ -194,6 +194,32 @@ pub fn escapes(entries: &[Entry]) -> Vec<Escape> {
     found
 }
 
+/// Whether the current rules already answer the call that got through.
+///
+/// An escape is two lines out of a log, and the log outlives the ruleset read
+/// against it. A hole closed since — by widening the rule that missed it, or by
+/// a rule written afterwards — leaves its pair in the history for good, and a
+/// report that keeps presenting finished work as a finding is a report nobody
+/// can act on. A rewrite counts as answered: the call no longer runs as written.
+///
+/// The cwd is the one the call ran in, since `in_workspace` means nothing
+/// against any other.
+pub fn closed(escape: &Escape, ruleset: &[Rule]) -> bool {
+    let input = serde_json::json!({ "command": escape.allowed });
+    let cwd = cwd(escape);
+    rules::evaluate(ruleset, "Bash", &input, cwd.as_deref(), None).outcome != Outcome::Allow
+}
+
+/// Where the call ran, since `in_workspace` means nothing against any other
+/// directory, and an example has to be weighed the same way the escape was.
+pub fn cwd(escape: &Escape) -> Option<PathBuf> {
+    escape
+        .cwd
+        .as_deref()
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+}
+
 /// The token that says the second command retries the first, if one does.
 ///
 /// Without this every deny pairs with whatever followed it, and almost none of
@@ -299,6 +325,111 @@ pub fn shapes(entries: &[Entry]) -> Vec<Shape> {
 pub struct Draft {
     pub notes: Vec<String>,
     pub spec: RuleSpec,
+    /// Lines of the rendered spec the draft is responsible for, so the reader
+    /// can find them in a rule that runs to a screenful. Empty for a rule with
+    /// no earlier version to be different from.
+    pub added: Vec<usize>,
+}
+
+/// One capped line, for a note that ends up as a `#` comment. A logged command
+/// can be a heredoc carrying a whole document, and a `fires` array carries
+/// whatever got logged; the first line of either is the part that says what it
+/// is.
+fn note_line(text: &str) -> String {
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or_default();
+    match (first.char_indices().nth(100), lines.next()) {
+        (Some((cut, _)), _) => format!("{} …", &first[..cut]),
+        (None, Some(_)) => format!("{first} …"),
+        (None, None) => first.to_string(),
+    }
+}
+
+/// Where `next` has lines `previous` does not, as indices into `next`.
+///
+/// A rule renders the same way every time and a draft only ever appends, so a
+/// line that turns up again further down the original re-syncs the walk and
+/// everything passed over on the way is what the draft added. Enough of a diff
+/// for an append, and not a general one.
+///
+/// Blank lines carry no content and are the one thing that re-syncs on the
+/// wrong place — the blank above an appended block matches the blank above the
+/// action, and every real line between them then reads as added.
+fn added_at(previous: &str, next: &str) -> Vec<usize> {
+    let old: Vec<&str> = previous.lines().collect();
+    let mut at = 0;
+    let mut added = Vec::new();
+    for (index, line) in next.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match old[at..].iter().position(|seen| *seen == line) {
+            Some(offset) => at += offset + 1,
+            None => added.push(index),
+        }
+    }
+    added
+}
+
+/// The block the escape came closest to, with the conditions that held it open
+/// taken out and nothing else changed.
+///
+/// A block drafted from the command alone matches every spelling of it, which
+/// swallows the escapes the rule already declares: `head = ["find"]` catches
+/// `find … -delete` too, and the paste fails its own `validate`. The block that
+/// missed already carries every discriminator the rule cares about, and the only
+/// thing wrong with it for this call is the operator that did not hold — so the
+/// narrow edit is that block without that operator.
+///
+/// One operator, not the whole condition. `args` can carry a `matches` that
+/// failed beside a `none_of` that held, and dropping both would give the escape
+/// back everything the rule was keeping out.
+fn relaxed(spec: &RuleSpec, escape: &Escape, element: usize) -> Option<MatchBlock> {
+    let rule = Rule::compile(spec.clone()).ok()?;
+    let input = serde_json::json!({ "command": escape.allowed });
+    let cwd = escape.cwd.as_deref().map(Path::new);
+    let trace = rules::trace_at(&[rule], "Bash", &input, cwd, Some(element))
+        .into_iter()
+        .next()?;
+    let mut block = spec.blocks.get(trace.block)?.clone();
+    for check in trace.checks.iter().filter(|check| !check.held) {
+        let Some(predicate) = block.conditions.get_mut(&check.path) else {
+            continue;
+        };
+        match check.op {
+            "any_of" => predicate.any_of = None,
+            "none_of" => predicate.none_of = None,
+            "glob" => predicate.glob = None,
+            "none_glob" => predicate.none_glob = None,
+            "matches" => predicate.matches = None,
+            "is" => predicate.is = None,
+            _ => {}
+        }
+    }
+    // A condition with no operators left asks nothing, and an empty table is not
+    // how a rule spells that.
+    block
+        .conditions
+        .retain(|_, predicate| predicate != &Predicate::default());
+    Some(block)
+}
+
+/// The example to ship for a logged command, shortened where that changes
+/// nothing.
+///
+/// What follows a heredoc operator is a document, and the lexer strips it
+/// before any rule sees it — so carrying it into an example puts a page of
+/// somebody's prose in a config and decides nothing. A line continuation, or a
+/// newline inside quotes, is not that: where shortening changes whether the
+/// rule fires, the whole command is the only example true of the rule shipping
+/// with it.
+fn example_for(rule: &Rule, escape: &Escape, fires: bool) -> String {
+    let short = escape.allowed.lines().next().unwrap_or_default();
+    let cwd = escape.cwd.as_deref().map(Path::new);
+    match rule.fires_on(short, cwd) == fires {
+        true => short.to_string(),
+        false => escape.allowed.clone(),
+    }
 }
 
 /// What every draft ends on: a rule matching on a command name is a wide thing
@@ -336,6 +467,8 @@ pub fn draft_rule(shape: &Shape) -> Draft {
                 ..TestSpec::default()
             },
         },
+        // All of it is new, and picking out every line says nothing.
+        added: Vec::new(),
     }
 }
 
@@ -352,40 +485,114 @@ pub fn draft_rule(shape: &Shape) -> Draft {
 /// would drop every discriminator the existing blocks carry — the caller checks
 /// `knows_head` and declines instead.
 pub fn draft_extension(spec: &RuleSpec, escape: &Escape) -> Option<Draft> {
-    let (_, segment) = rephrase(escape)?;
+    let (element, segment) = rephrase(escape)?;
     let mut extended = spec.clone();
     // Claiming a pipeline start the escape did not have would draft a block
     // that cannot fire on the very call it came from.
-    extended
-        .blocks
-        .push(segment_block(&segment.head, segment.pipeline_start));
-    extended.test.fires.push(escape.allowed.clone());
+    extended.blocks.push(
+        relaxed(spec, escape, element)
+            .unwrap_or_else(|| segment_block(&segment.head, segment.pipeline_start)),
+    );
+    // Two readings of one addition. The list is written before the example goes
+    // in, because a `fires` entry holding a heredoc renders across lines and a
+    // walk over lines cannot see that it is inside one string — so the example
+    // is named on its own terms instead. The indices are taken after, since
+    // they point into the artifact as it will actually be printed.
+    let previous = crate::config::to_toml(spec);
+    let blocked = crate::config::to_toml(&extended);
+    let mut change: Vec<String> = added_at(&previous, &blocked)
+        .into_iter()
+        .filter_map(|at| blocked.lines().nth(at))
+        .map(|line| format!("+ {}", note_line(line)))
+        .collect();
+    change.push(format!("+ fires += {}", note_line(&escape.allowed)));
+
+    let compiled = Rule::compile(extended.clone()).ok();
+    extended.test.fires.push(match &compiled {
+        Some(rule) => example_for(rule, escape, true),
+        None => escape.allowed.clone(),
+    });
+    let added = added_at(&previous, &crate::config::to_toml(&extended));
+
+    // Which of the rule's own declared escapes the new block would swallow.
+    let cwd = escape.cwd.as_deref().map(Path::new);
+    let broken: Vec<String> = compiled
+        .iter()
+        .flat_map(|rule| {
+            spec.test
+                .ignores
+                .iter()
+                .filter(|ignore| rule.fires_on(ignore, cwd))
+        })
+        .map(|ignore| format!("  {}", note_line(ignore)))
+        .collect();
 
     let mut notes = vec![
         format!(
             "`{}` was refused, and this got through {}s later:",
             spec.name, escape.gap_s
         ),
-        format!("  {}", escape.allowed),
+        format!("  {}", note_line(&escape.allowed)),
         String::new(),
-        "The whole rule, with that shape added as a block and the call added to".into(),
-        "`fires`. Paste it into your config: a later source replaces a rule of the".into(),
-        "same name, which is how a built-in gets extended.".into(),
+        "The whole rule, so it pastes into your config as it stands: a later".into(),
+        "source replaces a rule of the same name, which is how a built-in gets".into(),
+        "extended. Against the one you have now it adds:".into(),
         String::new(),
     ];
-    notes.extend([
-        "Then narrow it: the block matches on the command alone, which is wider".into(),
-        "than you probably want. The arguments the escape carried:".into(),
-    ]);
+    // The change spelled out, since the artifact below is the whole rule and
+    // reading a hundred unchanged lines to find four is the reason a diff
+    // exists.
+    notes.extend(change);
+    notes.push(String::new());
+    // The draft's own criticism, worked out rather than advised. A block drafted
+    // from one command matches on that command alone, so where the rule already
+    // declares an escape of the same command the new block swallows it — which
+    // `validate` refuses after a paste, and this says before one.
+    notes.extend(match broken.is_empty() {
+        true => vec![
+            "That block is the one this call missed, with what held it open taken".to_string(),
+            "out and every other condition the rule carries left alone. The".to_string(),
+            "arguments the escape carried, to narrow it further:".to_string(),
+        ],
+        false => vec![
+            "Narrow it further before pasting. Taking out what held this call open".to_string(),
+            "also gives back an escape the rule declares it must not fire on, which".to_string(),
+            "`validate` will refuse — so closing is likely the wrong answer here:".to_string(),
+        ],
+    });
+    if !broken.is_empty() {
+        notes.extend(broken);
+        notes.push(String::new());
+        notes.push("The arguments the escape carried, to narrow with:".into());
+    }
     notes.push(match segment.args.is_empty() {
         true => "  it took none; `args = { none_glob = [\"*\"] }` is how that is said".into(),
-        false => format!("  {}", segment.args.join(" ")),
+        false => format!("  {}", note_line(&segment.args.join(" "))),
     });
     notes.extend(blast_radius());
     Some(Draft {
         notes,
         spec: extended,
+        added,
     })
+}
+
+/// The command as an `ignores` example, or nothing where the rule turns out to
+/// fire on it after all.
+///
+/// The half of a fix a log can answer. Whether an escape was meant is a fact
+/// about intent that no pair of log lines holds, so what gets recorded is the
+/// claim that changes no matching: this rule does not fire on this call. It is
+/// trivially true the moment it is written and stops being trivial the moment
+/// anyone edits the rule — `validate` then refuses an edit that would swallow
+/// the call, where a prose comment above the rule refuses nothing.
+pub fn declaration(rule: &Rule, escape: &Escape) -> Option<String> {
+    let example = example_for(rule, escape, false);
+    let cwd = escape.cwd.as_deref().map(Path::new);
+    match rule.fires_on(&example, cwd) {
+        true => None,
+        false => Some(example),
+    }
 }
 
 /// The segment of the allowed command that stands in for the denied one.
@@ -683,6 +890,66 @@ mod tests {
         for still in &spec.test.fires {
             assert!(rule.fires_on(still, None), "still catches {still}");
         }
+
+        // What the draft points at has to be the block it appended and the
+        // example it added, and nothing the rule already carried. The walk is
+        // by line, and a rule repeats `any = "parsed.segments"` in every block.
+        let rendered = crate::config::to_toml(&draft.spec);
+        let marked: Vec<&str> = draft
+            .added
+            .iter()
+            .filter_map(|at| rendered.lines().nth(*at))
+            .collect();
+        assert!(
+            marked.iter().any(|line| line.starts_with("fires = ")),
+            "{marked:?}"
+        );
+        // The block it adds is the one this call missed with the condition that
+        // held it open dropped, not a bare match on the command. So it keeps the
+        // rule's own head list and loses only `args.0` — which is what stops a
+        // draft swallowing every other escape the rule was written to allow.
+        assert!(
+            marked.contains(&"head = { any_of = [\"python\", \"python3\"] }"),
+            "{marked:?}"
+        );
+        assert!(
+            !marked.iter().any(|line| line.contains("args.0")),
+            "the condition that held it open is the one dropped: {marked:?}"
+        );
+    }
+
+    // The pair that motivated the bucket. `cat /tmp/…` was a hole in the pager
+    // rule until its workspace guard came off; the log still holds the escape,
+    // and only the live rules say the work is done.
+    #[test]
+    fn a_pair_the_rules_now_answer_is_closed() {
+        let file: crate::config::ConfigFile =
+            toml::from_str(include_str!("builtin.toml")).expect("built-ins");
+        let ruleset: Vec<Rule> = file
+            .rules
+            .into_iter()
+            .map(|spec| Rule::compile(spec).expect("a built-in"))
+            .collect();
+
+        let escape = |allowed: &str| Escape {
+            denied: "cat -n src/replay.rs".into(),
+            rules: vec!["read-over-shell-pager".into()],
+            allowed: allowed.into(),
+            gap_s: 7,
+            shared: "cat".into(),
+            cwd: Some("/workspace".into()),
+        };
+
+        assert!(closed(
+            &escape("cat /tmp/review.diff | head -400"),
+            &ruleset
+        ));
+        // The rule's documented escape rather than a hole: fff cannot index the
+        // registry, so nothing here is waiting to be closed.
+        assert!(!closed(
+            &escape("rg -n Middleware /Users/x/.cargo/registry/src/lib.rs"),
+            &ruleset
+        ));
     }
 
     #[test]

@@ -57,7 +57,7 @@ steer check '<command>'
 steer replay [--since <age>]
 
 # escapes and uncaught shapes from the log
-steer suggest [--since <age>] [--strong|--all] [--draft <name>]
+steer suggest [--since <age>] [--all] [--apply|--draft <name>]
 
 # the effective ruleset and its problems
 steer validate
@@ -80,10 +80,12 @@ Rules come from three places, each stacking on the one before:
   commented starter there.
 - **`.steer.toml` in the repo**, found by walking up from the session's working directory.
 
-A later source replaces an earlier rule of the same name, and `disable = ["fff-over-grep"]` switches
-one off wherever it came from. `steer validate` prints the whole stack — every source, the rules it
-declares, what each one tests, and what became of it once the sources collapsed — along with unknown
-fields, bad globs, duplicate names, and failing tests, with file and line, and exit 1.
+A later source replaces an earlier rule of the same name, `disable = ["fff-over-grep"]` switches one
+off wherever it came from, and `builtins = false` starts from none of them — a `disable` list naming
+them all is complete only until the next built-in ships. `steer validate` prints the whole stack —
+every source, the rules it declares, what each one tests, and what became of it once the sources
+collapsed — along with unknown fields, bad globs, duplicate names, and failing tests, with file and
+line, and exit 1.
 
 ## Write a rule
 
@@ -123,6 +125,7 @@ action does, and the harness gates.
 | `fff-over-grep` | deny | claude | `grep`, `rg`, `find`, `git grep` and friends leading a pipeline over an indexed path |
 | `read-over-shell-pager` | deny | claude | `sed -n`, `cat -n`, `cat file \| head`, `awk 'NR>=x'` — the family of ways to ask for a line range from a file |
 | `edit-over-python` | deny | all | `python3 - <<'PY'`, a whole program written inline to do file surgery |
+| `edit-over-inplace` | deny | all | `sed -i`, `perl -pi`, `awk -i inplace` — the same file surgery written as a flag |
 | `trash-over-rm` | rewrite | all | `rm` becomes `trash`, recursive and force flags dropped |
 
 Two are Claude-only because of where their messages point: Codex has no read tool and no fff, and a
@@ -134,7 +137,12 @@ Every deny, rewrite, and context injection — plus every allowed **Bash** call 
 to `~/.local/state/steer/steer.jsonl`. `steer replay` runs the current rules over that log and prints
 only what they would now answer differently, which is how a rule gets tested before it ships.
 `steer suggest` reports what the log says is missing: a deny and the command that got through right
-behind it, and the leading commands of calls nothing caught.
+behind it, and the leading commands of calls nothing caught. It sorts those pairs first — `closed`
+where the rules now answer them, `by design` where the rule declares that escape in its own
+`ignores`, `weak` where the denying rule never named the command that ran — and what is left prints
+as a `fix`, one line per rule and condition. `--apply` writes those to your config as escapes their
+rules allow, an `[[amend]]` entry that changes no matching and that `validate` holds from then on.
+`--draft <rule>` prints the block that closes one instead, which is a rule edit you make.
 
 ## License
 

@@ -88,10 +88,10 @@ fn main() {
         Sub::Replay { since } => cli::replay_cmd(since),
         Sub::Suggest {
             since,
+            apply,
             draft,
-            strong,
             all,
-        } => cli::suggest_cmd(since, draft, strong, all),
+        } => cli::suggest_cmd(since, apply, draft, all),
         Sub::Validate => cli::validate(),
         Sub::Init => cli::init(),
     };

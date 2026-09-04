@@ -1,7 +1,13 @@
 # Compiled into the binary and active with no config at all, so installing
-# steer is a one-line dotfiles entry. Disable any of them by name:
+# steer is a one-line dotfiles entry. Drop one you do not share:
 #
 #   disable = ["fff-over-grep"]
+#
+# Or start from none of them, which is the setting to reach for when these
+# opinions are not yours — a `disable` list is complete only until the next
+# built-in ships:
+#
+#   builtins = false
 
 # A hook can rewrite tool input but cannot switch tools, so pointing a shell
 # search at the fff MCP server has to be a deny with guidance.
@@ -64,11 +70,15 @@ They are frecency-ranked and index-aware. A shell search after a pipe, one \
 that lands outside this workspace or under node_modules, and a `find` that \
 acts on what it finds (`-delete`, `-exec`) are all still fine."""
 
-# Relative paths only: an absolute one outside the tree would flip to
-# in-workspace for whoever runs validate from `/`.
+# Relative paths only for `fires`: an absolute one outside the tree would flip
+# to in-workspace for whoever runs validate from `/`.
+#
+# Every escape named in the comments above has an `ignores` line, which is what
+# makes it a claim rather than a remark — `validate` runs these, and `suggest`
+# reads them to tell an escape the rule meant from a hole it did not.
 [rules.test]
 fires = ["grep -rn foo src", "git grep -n RecordStore", "find . -name '*.tsx'"]
-ignores = ["gh pr list | grep foo", "find . -name '*.log' -delete", "rg -n lib node_modules/@scope"]
+ignores = ["gh pr list | grep foo", "find . -name '*.log' -delete", "rg -n lib node_modules/@scope", "grep -rn foo /usr/local/include", "find /usr/local/include -name '*.h'"]
 
 # A file read wearing a stream editor's clothes, and its whole family. Blocking
 # one spelling only moves the intent to the next: denied `sed -n`, a model
@@ -81,6 +91,12 @@ ignores = ["gh pr list | grep foo", "find . -name '*.log' -delete", "rg -n lib n
 # a bare `head -5` through. And `NR` is the line-range tell that separates awk
 # paging a file from awk computing over one — a heuristic, deliberately, rather
 # than parsing the awk program.
+#
+# There is no workspace guard. Read has no such boundary, so a scratch file
+# under /tmp is as readable through it as one in the tree, and a guard here only
+# taught the model to park a diff outside the tree and page it there. The cost
+# is that `cat a b > merged`, a real concatenation, has to be written some other
+# way.
 [[rules]]
 name = "read-over-shell-pager"
 description = "Shell file reads and line-range pagers belong to the Read tool."
@@ -97,14 +113,12 @@ pipeline_start = { is = true }
 any = "parsed.segments"
 head = { any_of = ["cat", "head", "tail", "bat"] }
 pipeline_start = { is = true }
-in_workspace = { is = true }
 args = { matches = "^[^-]", none_of = ["-f", "--follow"] }
 
 [[rules.match]]
 any = "parsed.segments"
 head = { any_of = ["awk", "gawk", "mawk", "perl"] }
 pipeline_start = { is = true }
-in_workspace = { is = true }
 args = { matches = "NR" }
 
 [rules.action]
@@ -122,11 +136,12 @@ formatter — redirect it instead of catting it: `jq . < data.json`, not \
 `cat data.json | jq .`. The redirect is not a read, so it passes.
 
 Escapes: any of these after a pipe is a filter on output that already exists \
-and is fine, as is `tail -f`, and so is a file outside this workspace."""
+and is fine, as is `tail -f`."""
 
+# `cat > out <<EOF` is the escape `^[^-]` exists for.
 [rules.test]
-fires = ["sed -n 800,900p src/rules.rs", "cat README.md", "awk 'NR>=10 && NR<=20' src/main.rs"]
-ignores = ["jq . < data.json", "tail -f server.log", "go test ./... | head -20"]
+fires = ["sed -n 800,900p src/rules.rs", "cat README.md", "awk 'NR>=10 && NR<=20' src/main.rs", "cat /tmp/review.diff"]
+ignores = ["jq . < data.json", "tail -f server.log", "go test ./... | head -20", "cat > out.md <<'EOF'"]
 
 # Same failure class as the pager rule: a shell command standing in for a
 # dedicated tool. A whole program written inline to stdin is nearly always file
@@ -158,8 +173,8 @@ head = { any_of = ["python", "python3"] }
 args = { none_glob = ["*"] }
 pipeline_start = { is = true }
 
-# The only built-in that reaches both harnesses. The offense is identical under
-# either, an unreviewable edit arriving as a program, so only the tool name differs.
+# The offense is identical under either harness, an unreviewable edit arriving as
+# a program, so only the tool name differs.
 [rules.action]
 kind = "deny"
 
@@ -185,6 +200,58 @@ being fed data, not a program editing files, and is fine too."""
 [rules.test]
 fires = ["python3 - <<'PY'", "python3 <<'PY'"]
 ignores = ["python3 -c 'print(1)'", "python3 scripts/build.py", "cat data.json | python3 -"]
+
+# An in-place stream edit is the same unreviewable edit written as a flag. `sed
+# -i` and `perl -pi` rewrite a tracked file with nothing in the transcript to
+# show for it and no failure when the text they were told to replace was never
+# there. Observed as the retry after a read was refused: denied a `grep` of
+# `src/main.rs`, the model came back with `sed -i '' '/.../d' src/main.rs`.
+#
+# The alphabet inside the regex is the whole precision. Perl bundles its
+# one-letter switches, so the tell is an `i` at the end of a run rather than a
+# bare `-i`: `-0pi` and `-nli` are in-place too. The run holds only the switches
+# that legitimately precede it, which is what keeps `-MList::Util`, `-Ilib` and
+# `-mstrict` out — and `e` in particular has to stay out, since a quoted program
+# written tight against its flag arrives as `-eprint 1`.
+#
+# Known ceiling: `find -exec sed -i` still gets through, because a find carrying
+# an action primary is deliberately not a search. Wide enough to matter and
+# `suggest` will surface it.
+[[rules]]
+name = "edit-over-inplace"
+description = "In-place stream edits belong to a real edit tool."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["sed", "gsed", "perl", "awk", "gawk", "mawk"] }
+args = { matches = "^(-[0-9nplawsEr]*i|--in-place)" }
+
+[rules.action]
+kind = "deny"
+
+[rules.action.message]
+claude = """
+Use the Edit tool to change a file and the Write tool to create one. Both show \
+the change in the transcript, and Edit fails loudly when the text it was told \
+to replace is not there, rather than writing something unintended.
+
+A stream editor writing to stdout or into a pipe is transforming a stream \
+rather than editing a file, and is fine: `sed 's/a/b/' in > out`, \
+`git diff | perl -pe '...'`."""
+codex = """
+Use `apply_patch` to edit a file. It shows the change as a patch and fails when \
+the context it was given does not match, rather than writing something \
+unintended.
+
+A stream editor writing to stdout or into a pipe is transforming a stream \
+rather than editing a file, and is fine: `sed 's/a/b/' in > out`, \
+`git diff | perl -pe '...'`."""
+
+# The ignores are the false positives that shaped the alphabet.
+[rules.test]
+fires = ["sed -i '' 's/a/b/' Cargo.toml", "perl -0pi -e 's/a/b/' Taskfile.yml", "gsed --in-place 's/a/b/' src/main.rs"]
+ignores = ["perl -MList::Util -e 1", "perl -mstrict -e 1", "perl -e'print 1'", "perl -lane 'print' f", "git diff | perl -pe 's/a/b/'"]
 
 # Same-tool correction, so it happens silently. The engine holds it back
 # wherever `trash` is missing from PATH, which is every Linux VM.

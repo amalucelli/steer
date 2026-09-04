@@ -88,6 +88,9 @@ enum State {
 }
 
 fn state(report: &config::Report, layer: usize, position: usize, spec: &rules::RuleSpec) -> State {
+    if report.layers[layer].off {
+        return State::Dropped("turned off by `builtins = false`".into());
+    }
     let later = report
         .layers
         .iter()

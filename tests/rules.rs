@@ -57,6 +57,11 @@ impl Sandbox {
         fs::write(path, contents).expect("write global config");
     }
 
+    fn global_text(&self) -> String {
+        let path = self.dir.join("config").join("steer").join("config.toml");
+        fs::read_to_string(path).unwrap_or_default()
+    }
+
     /// Puts an executable stub of `name` on the PATH the binary will see.
     fn stub_binary(&self, name: &str) {
         let path = self.dir.join("bin").join(name);
@@ -79,6 +84,26 @@ impl Sandbox {
 
     /// Writes the log the reading commands read, for the pairs that are
     /// tedious to produce by driving the hook.
+    /// One log line as the hook writes it, from the sandbox's own workspace so
+    /// `in_workspace` weighs the same way it did when the call ran.
+    fn entry(
+        &self,
+        ts_ms: u64,
+        outcome: &str,
+        rules: serde_json::Value,
+        command: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "ts_ms": ts_ms,
+            "outcome": outcome,
+            "rules": rules,
+            "tool_name": "Bash",
+            "session_id": "s1",
+            "cwd": self.work().display().to_string(),
+            "tool_input": { "command": command },
+        })
+    }
+
     fn write_log(&self, entries: &[serde_json::Value]) {
         let dir = self.dir.join("state").join("steer");
         fs::create_dir_all(&dir).expect("create state dir");
@@ -238,6 +263,10 @@ fn every_spelling_of_a_windowed_read_is_denied() {
         // `cat` is what the rule claims, whatever comes after the pipe.
         "cat data.json | sed -n 1,5p",
         "cat data.json | grep foo",
+        // Read reaches outside the tree, so where the file sits is not a way
+        // out. Parking a diff in /tmp and paging it there was the live escape.
+        "cat /tmp/review.diff",
+        "cat /etc/hosts",
     ];
     let allow: &[&str] = &[
         // awk computing over a file rather than paging one.
@@ -249,10 +278,8 @@ fn every_spelling_of_a_windowed_read_is_denied() {
         // No file operand: a heredoc write and a bare pager.
         "cat > clean.sh <<EOF\nx\nEOF\n",
         "head -5",
-        // Following a log is not a windowed read, and neither is a file
-        // outside the workspace.
+        // Following a log is not a windowed read.
         "tail -f logs/app.log",
-        "cat /etc/hosts",
     ];
 
     for command in deny {
@@ -354,6 +381,67 @@ fn inline_python_programs_are_denied_and_computations_are_not() {
     for command in allow {
         assert!(!is_denied(&decision(&sandbox, command)), "{command:?}");
     }
+}
+
+// The same intent as the inline program, spelled as a flag. Observed in a live
+// session: denied a `grep` of src/main.rs, the model came back a minute later
+// with `sed -i '' '/.../d' src/main.rs` and edited the file with nothing in the
+// transcript to review.
+#[test]
+fn in_place_stream_edits_are_denied_and_stream_transforms_are_not() {
+    let sandbox = Sandbox::new("inplace");
+
+    let deny: &[&str] = &[
+        "sed -i '' '/about = env!(\"CARGO_PKG_DESCRIPTION\"),/d' src/main.rs",
+        "sed -i.bak 's/a/b/' src/main.rs",
+        "perl -0pi -e 's{a}{b}' Taskfile.yml",
+        "perl -Ilib -pi -e 's/a/b/' src/main.rs",
+        "gsed --in-place 's/a/b/' src/main.rs",
+        "awk -i inplace '{print}' src/main.rs",
+        // Uppercase inside the bundle is what `-MList::Util` is held out by, so
+        // the one real spelling that carries it has to still land.
+        "sed -Ei '' 's/a/b/' src/main.rs",
+        // No workspace guard: an unreviewable edit is one wherever it lands.
+        "sed -i '' 's/a/b/' /tmp/scratch.txt",
+    ];
+    let allow: &[&str] = &[
+        // The false positives the run's alphabet exists to exclude. The last is
+        // a program written tight against its flag, which reaches the rule as
+        // `-eprint 1` once the quotes are stripped.
+        "perl -MList::Util -e 1",
+        "perl -mstrict -e 1",
+        "perl -Ilib -pe 'print' f",
+        "perl -lane 'print $F[0]' f",
+        "perl -e'print 1'",
+        // Writing to stdout or into a pipe transforms a stream, and edits
+        // nothing.
+        "sed -E 's/a/b/' in.txt > out.txt",
+        "git diff | perl -pe 's/a/b/'",
+        "awk '{print $1}' data.csv",
+    ];
+
+    for command in deny {
+        assert!(is_denied(&decision(&sandbox, command)), "{command:?}");
+    }
+    for command in allow {
+        assert!(!is_denied(&decision(&sandbox, command)), "{command:?}");
+    }
+}
+
+// The second built-in to reach both harnesses, so the tool its guidance names
+// has to follow the harness rather than the rule.
+#[test]
+fn the_in_place_deny_names_each_harnesss_edit_tool() {
+    let sandbox = Sandbox::new("inplaceagents");
+    let payload = bash_payload("sed -i '' 's/a/b/' src/main.rs", Some(&sandbox.work()));
+
+    let claude = sandbox.hook_as("claude", "PreToolUse", &payload);
+    assert!(is_denied(&claude), "{claude}");
+    assert!(reason(&claude).contains("Edit tool"), "{claude}");
+
+    let codex = sandbox.hook_as("codex", "PreToolUse", &payload);
+    assert!(is_denied(&codex), "{codex}");
+    assert!(reason(&codex).contains("apply_patch"), "{codex}");
 }
 
 // A find that acts on what it traverses is not a search, and the fff tools
@@ -1095,12 +1183,233 @@ fn draft_declines_when_the_rule_does_not_know_the_command_that_followed() {
     // The report counts a weak pair rather than printing it: it is a question,
     // and there are always more questions than findings.
     let (out, _) = cli(&sandbox, &["suggest"]);
-    assert!(!out.contains("escape "), "{out}");
-    assert!(out.contains("weak      1 more pair"), "{out}");
+    assert!(out.contains("0 fixes"), "nothing to act on: {out}");
+    assert!(out.contains("weak      1 pair where"), "{out}");
 
     // Asking for them says the same thing in a line, per pair.
     let (out, _) = cli(&sandbox, &["suggest", "--all"]);
-    assert!(out.contains("signal  weak"), "{out}");
+    assert!(
+        out.contains("signal  the rule says nothing about `task`"),
+        "{out}"
+    );
+}
+
+// A log outlives the rules read against it, so the same pair keeps coming back
+// long after the edit that closed it. Sorting is what makes the report
+// actionable: the pair today's rules answer is finished, and the one still
+// getting through is named with the condition an edit would go to.
+#[test]
+fn suggest_sorts_a_closed_pair_out_of_the_fixes() {
+    let sandbox = Sandbox::new("sorted");
+    let searches = serde_json::json!(["fff-over-grep"]);
+    let pagers = serde_json::json!(["read-over-shell-pager"]);
+    let allowed =
+        |ts_ms: u64, command: &str| sandbox.entry(ts_ms, "allow", serde_json::json!([]), command);
+    sandbox.write_log(&[
+        // Earliest in the log and weak: the rule was refused and something else
+        // entirely ran next. Drafting reaches for the finding, not for this.
+        sandbox.entry(
+            100,
+            "deny",
+            searches.clone(),
+            "grep -n ts:security Taskfile.yml",
+        ),
+        allowed(200, "task ts:security"),
+        // Four of one thing: a `git grep` outside the tree. That block declares
+        // no escapes of its own, so this is a hole rather than a decision the
+        // rule already made.
+        sandbox.entry(1_000, "deny", searches.clone(), "git grep -n foo src"),
+        allowed(5_000, "git grep -n foo /etc/hosts"),
+        sandbox.entry(10_000, "deny", searches.clone(), "git grep -n bar src"),
+        allowed(12_000, "git grep -n bar /usr/local/include"),
+        sandbox.entry(20_000, "deny", searches.clone(), "git grep -n baz docs"),
+        allowed(22_000, "git grep -n baz /opt/homebrew/share"),
+        sandbox.entry(30_000, "deny", searches, "git grep -n qux dist"),
+        allowed(32_000, "git grep -n qux /var/log"),
+        sandbox.entry(70_000, "deny", pagers, "cat -n src/main.rs"),
+        // The pager rule dropped its workspace guard, so today this is a deny
+        // and the pair is an edit already made.
+        allowed(72_000, "cat /tmp/notes.md"),
+    ]);
+
+    let (out, code) = cli(&sandbox, &["suggest"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("fix       fff-over-grep"),
+        "the open pair leads, under the rule an edit goes to: {out}"
+    );
+    assert!(
+        out.contains("in_workspace"),
+        "named by the condition that held the rule open: {out}"
+    );
+    assert!(
+        !out.contains("fix       read-over-shell-pager"),
+        "a pair today's rules answer is not a finding: {out}"
+    );
+    assert!(out.contains("closed    1 pair"), "{out}");
+    assert!(out.contains("1 fix, 1 closed"), "{out}");
+    // Four pairs are one edit, so the group is the finding and the evidence
+    // under it stops at enough to judge the pairing on.
+    assert!(out.contains("4 pairs"), "{out}");
+    assert!(out.contains("1 more like it"), "{out}");
+    assert!(!out.contains("/var/log"), "{out}");
+    // One rule can be open through two conditions, and those are two edits, so
+    // the command a fix line prints has to say which.
+    assert!(out.contains("--draft fff-over-grep:in_workspace"), "{out}");
+
+    let (out, _) = cli(&sandbox, &["suggest", "--all"]);
+    assert!(out.contains("/var/log"), "asking gets the rest: {out}");
+
+    // The command a fix line prints has to land on that fix. Reading the log
+    // in time order instead reaches the weak pair and declines over a finding
+    // the report never showed.
+    for name in ["fff-over-grep", "fff-over-grep:in_workspace"] {
+        let (out, code) = cli(&sandbox, &["suggest", "--draft", name]);
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("[[rules]]"), "{out}");
+        assert!(!out.contains("says nothing about `task`"), "{out}");
+        // The block is the one this call missed with `in_workspace` dropped, so
+        // the subcommand that pins the rule to `git grep` survives. A block
+        // drafted from the command alone would have caught every `git`.
+        assert!(
+            out.contains("# + \"args.0\" = { any_of = [\"grep\"] }"),
+            "{out}"
+        );
+    }
+
+    // And it pastes: the narrowed block closes the escape without touching what
+    // the rule declares it must leave alone.
+    let (draft, _) = cli(&sandbox, &["suggest", "--draft", "fff-over-grep"]);
+    sandbox.write_global(&draft);
+    let (out, code) = cli(&sandbox, &["validate"]);
+    assert_eq!(code, 0, "the narrowed draft holds its own examples: {out}");
+    sandbox.write_global("");
+
+    // The other answer, and the one a log can take on its own. It writes to the
+    // config `suggest` was run in, records every fix as an escape its rule
+    // allows, and the finding is answered.
+    let (out, code) = cli(&sandbox, &["suggest", "--apply"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("apply     fff-over-grep"), "{out}");
+    assert!(out.contains("4 declared"), "{out}");
+
+    let (out, code) = cli(&sandbox, &["validate"]);
+    assert_eq!(code, 0, "the declarations have to hold: {out}");
+    let (out, _) = cli(&sandbox, &["suggest"]);
+    assert!(out.contains("0 fixes"), "the finding is answered: {out}");
+    assert!(out.contains("design    4 pairs"), "{out}");
+
+    // An amendment, not a copy of the rule: a copy pins the built-in at the
+    // text pasted.
+    let written = sandbox.global_text();
+    assert!(written.contains("[[amend]]"), "{written}");
+    assert!(!written.contains("[[rules.match]]"), "{written}");
+    assert!(written.lines().count() < 15, "{written}");
+}
+
+// A draft is a paste, so the only test that means anything is the paste: write
+// it where a config goes and ask the binary to read it back. The escape here is
+// a heredoc, which is the shape that put a document into the comment block and
+// left every line of it after the first as bare TOML.
+#[test]
+fn a_draft_written_to_a_config_is_a_config() {
+    let sandbox = Sandbox::new("pasted");
+    sandbox.write_log(&[
+        sandbox.entry(
+            1_000,
+            "deny",
+            serde_json::json!(["read-over-shell-pager"]),
+            "cat src/main.rs",
+        ),
+        sandbox.entry(
+            3_000,
+            "allow",
+            serde_json::json!([]),
+            "cat > /tmp/pr.md <<'BODY'\n## Ticket\n\n* ENG-1\n\nprose that is not toml\nBODY",
+        ),
+    ]);
+
+    let (draft, code) = cli(&sandbox, &["suggest", "--draft", "read-over-shell-pager"]);
+    assert_eq!(code, 0, "{draft}");
+    // The change, spelled out above the whole rule it is buried in.
+    assert!(draft.contains("# + [[rules.match]]"), "{draft}");
+    // The block it adds is the one that missed with the `matches` that held it
+    // open dropped, so the `-f` exclusion beside it survives.
+    assert!(
+        draft.contains("# + head = { any_of = [\"cat\", \"head\", \"tail\", \"bat\"] }"),
+        "{draft}"
+    );
+    assert!(
+        draft.contains("# + args = { none_of = [\"-f\", \"--follow\"] }"),
+        "{draft}"
+    );
+    assert!(draft.contains("# + fires += cat > /tmp/pr.md"), "{draft}");
+    // The example is the command, not the document it was carrying: a heredoc
+    // body is stripped before any rule sees it, so shipping it would put a page
+    // of somebody's prose in a config to no end.
+    assert!(draft.contains("\"cat > /tmp/pr.md <<'BODY'\""), "{draft}");
+    assert!(!draft.contains("prose that is not toml"), "{draft}");
+
+    sandbox.write_global(&draft);
+    let (out, _) = cli(&sandbox, &["validate"]);
+    assert!(!out.contains("unparsed"), "{out}");
+    assert!(!out.contains("TOML parse error"), "{out}");
+    // And the two halves interlocking. `cat > out <<EOF` is an escape the pager
+    // rule declares, and here even the narrowed block reaches it — dropping the
+    // `matches` that held the escape open is what the escape *was*. `validate`
+    // names the contradiction, which is the report saying closing was the wrong
+    // answer for this one.
+    assert!(
+        out.contains("`ignores` example \"cat > out.md <<'EOF'\" fires `read-over-shell-pager`"),
+        "{out}"
+    );
+
+    sandbox.write_global("");
+    let (out, code) = cli(&sandbox, &["suggest", "--apply"]);
+    assert_eq!(code, 0, "{out}");
+    let (out, code) = cli(&sandbox, &["validate"]);
+    assert_eq!(code, 0, "the answer this finding wanted: {out}");
+    let (out, _) = cli(&sandbox, &["suggest"]);
+    assert!(out.contains("0 fixes"), "{out}");
+    assert!(out.contains("design    1 pair"), "{out}");
+}
+
+// The built-ins are opinions, and they are not everyone's. Naming all of them
+// in `disable` is complete only until the next one ships, so starting from none
+// of them is its own setting — and the report has to show what it turned off
+// rather than an empty stack.
+#[test]
+fn builtins_can_be_switched_off_wholesale() {
+    let sandbox = Sandbox::new("nobuiltins");
+    sandbox.write_global(
+        r#"
+builtins = false
+
+[[rules]]
+name = "mine"
+tool = "Bash"
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["psql"] }
+[rules.action]
+kind = "deny"
+message = "not against prod"
+[rules.test]
+fires = ["psql -h prod"]
+"#,
+    );
+
+    let (out, code) = cli(&sandbox, &["validate"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("ok        1 rules"), "{out}");
+    assert!(
+        out.contains("turned off by `builtins = false`"),
+        "listed, and said to be off: {out}"
+    );
+
+    // The rules are gone from the decision, not merely from the report.
+    assert!(!is_denied(&decision(&sandbox, "grep -rn foo src")), "{out}");
+    assert!(is_denied(&decision(&sandbox, "psql -h prod")), "{out}");
 }
 
 // An example that stops being true has to fail, or it is just a comment.
@@ -1301,7 +1610,7 @@ message = "x"
     );
     // Piped output carries no escapes, so it stays greppable.
     assert!(!out.contains('\u{1b}'), "{out}");
-    assert!(out.contains("ok        3 rules"), "{out}");
+    assert!(out.contains("ok        4 rules"), "{out}");
 }
 
 #[test]

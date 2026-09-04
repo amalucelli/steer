@@ -94,17 +94,18 @@ pub enum Sub {
         /// number is days
         #[arg(long, value_name = "AGE", value_parser = window_ms)]
         since: Option<u64>,
-        /// Write TOML for one finding: a rule name closes its escape, a head
-        /// starts a rule for that shape
-        #[arg(long, value_name = "NAME")]
-        draft: Option<String>,
-        /// Only the escapes worth acting on: a rule that already knows the
-        /// command that got past it. Drops the shapes, which are frequency
-        /// counts rather than findings
+        /// Record every fix in the config as an escape its rule means to
+        /// allow, which is the half a log can answer. Closing one instead is a
+        /// rule edit, and the report prints the block for it
         #[arg(long)]
-        strong: bool,
-        /// List the weak pairs too, which the report otherwise counts in a line
-        #[arg(long, conflicts_with = "strong")]
+        apply: bool,
+        /// Write TOML for one finding to stdout instead: a rule name closes its
+        /// escape, a head starts a rule for that shape
+        #[arg(long, value_name = "NAME", conflicts_with = "apply")]
+        draft: Option<String>,
+        /// Every pair behind each fix, and the weak ones the report otherwise
+        /// counts in a line
+        #[arg(long)]
         all: bool,
     },
     /// Print the effective ruleset, with any problems in it
