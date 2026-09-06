@@ -1,0 +1,204 @@
+# Session semantics.
+#
+# Nothing here is compiled into the binary, and installing steer does not turn
+# any of it on. Copy what you want into `~/.config/steer/config.toml` or a repo
+# `.steer.toml`, and leave the rest.
+#
+#   steer check --config examples/session.toml 'source .venv/bin/activate'
+#   steer validate --config examples/session.toml
+#
+# The odd file out: none of these guard against harm. They catch commands that
+# simply do not work the way they look like they work, because each tool call
+# is its own process with its own shell and its own timeout. The failures are
+# cheap and confusing rather than expensive — a variable that is unset in the
+# next call, a wait that burns the budget, a prompt nobody answers.
+#
+# The built-in `no-interactive-commands` came from this family and is the same
+# idea: not a judgement about what is safe, a fact about where the command runs.
+
+
+# Every tool call gets a fresh shell. An `export` sets a variable that is gone
+# by the next call, a `source` activates an environment nothing later is in, and
+# a lone `cd` moves a working directory that resets the moment it returns. None
+# of them fail — they succeed and change nothing, which is worse, because the
+# next command fails for a reason that looks unrelated.
+#
+# The only rule in these files that binds with `all` rather than `any`, and it
+# has to. `source .venv/bin/activate && pytest` is the correct way to write
+# this, and its first segment is a `source` — matching any segment would deny
+# the very thing the message recommends. `all` holds only when every segment is
+# one of these, which is exactly the case where the call accomplishes nothing.
+#
+# An empty array never satisfies `all`, so a command that produces no segments
+# cannot trip this.
+[[rules]]
+name = "shell-state-does-not-persist"
+description = "Each tool call is a new shell; state set in one is gone in the next."
+tool = "Bash"
+
+[[rules.match]]
+all = "parsed.segments"
+head = { any_of = ["export", "source", ".", "cd", "alias", "unalias", "set", "shopt", "umask", "nvm", "pyenv", "rbenv"] }
+
+[rules.action]
+kind = "deny"
+message = """
+This call sets up state and then ends, and the next call starts a new shell \
+that never sees it.
+
+Put the setup and the work in the same command:
+
+  source .venv/bin/activate && pytest tests/test_x.py
+  cd services/api && cargo test
+  FOO=bar cargo run
+
+For a directory, most tools take one directly — `cargo test \
+--manifest-path`, `git -C`, `npm --prefix` — which is shorter than chaining \
+and does not depend on the order."""
+
+[rules.test]
+fires = ["export FOO=bar", "source .venv/bin/activate", "cd services/api", ". ./env.sh", "cd a && cd b"]
+ignores = ["source .venv/bin/activate && pytest", "cd services/api && cargo test", "FOO=bar cargo run", "cargo test"]
+
+
+# A tool call has a time budget, and a sleep spends it doing nothing. Worse, it
+# usually means the call is waiting on something it cannot see — a server
+# starting, a deploy settling — with a duration picked by guessing.
+#
+# The threshold is written into the regex, because a condition compares strings
+# and cannot compare numbers. Two or more digits is ten seconds and up, and any
+# duration given in minutes or hours qualifies whatever its digits.
+#
+# Short sleeps pass on purpose. `sleep 2 && curl localhost:3000/health` is a
+# reasonable poll, and the rule should not have an opinion about it.
+[[rules]]
+name = "no-blocking-sleep"
+description = "A sleep spends the call's time budget waiting for something it cannot observe."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["sleep"] }
+args = { matches = '^[0-9]{2,}$|^[0-9]+(\.[0-9]+)?[mh]$' }
+
+[rules.action]
+kind = "deny"
+message = """
+The call has a time budget and this spends it waiting. If the wait is guessing \
+how long something takes, it is either too short to work or too long to be \
+worth it.
+
+Poll for the condition instead of the clock:
+
+  until curl -sf localhost:3000/health; do sleep 1; done
+
+A short sleep is fine — this only refuses ten seconds and up."""
+
+[rules.test]
+fires = ["sleep 300", "sleep 5m", "sleep 30 && curl localhost:3000"]
+ignores = ["sleep 2", "sleep 0.5", "sleep 5"]
+
+
+# A process started here outlives the call and nothing is left holding a
+# reference to it. It keeps its port, keeps its log file open, and the next run
+# fails for a reason that has nothing to do with the change.
+#
+# Known ceiling, and a hard one: a trailing `&` is not visible. The lexer drops
+# it, so `npm start &` arrives as a plain `npm start` with nothing to
+# distinguish it. This catches the spellings that survive as a command —
+# `nohup`, a terminal multiplexer, an explicit daemon flag — and misses the
+# shortest one. `no-background-servers` in examples/workflow.toml covers the
+# same ground from the other side, by naming the servers rather than the
+# backgrounding.
+[[rules]]
+name = "no-detached-process"
+description = "A detached process outlives the call and nothing is left to stop it."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["nohup", "screen", "tmux", "daemonize", "start-stop-daemon", "launchctl", "systemctl"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["docker", "podman"] }
+"args.0" = { any_of = ["run"] }
+args = { any_of = ["-d", "--detach"] }
+
+[rules.action]
+kind = "deny"
+message = """
+This starts something that keeps running after the call returns, and nothing \
+in the session can stop it afterwards.
+
+If the work needs to finish, run it in the foreground and let the call wait \
+for it. If it needs to stay up — a database, a dev server — that is the \
+user's terminal, where they can see it and kill it.
+
+Known gap worth knowing: a trailing `&` is invisible here, so this is not a \
+guarantee."""
+
+[rules.test]
+fires = ["nohup npm start", "tmux new-session -d 'npm run dev'", "docker run -d postgres:16"]
+ignores = ["npm start", "docker run --rm postgres:16 psql --version", "docker ps"]
+
+
+# A setup wizard reads from stdin, and there is no stdin here. These are worse
+# than an editor hanging, because several of them write half a config before
+# they reach the prompt and leave it there when the call is killed.
+#
+# Each block is a flag away from being fine, and the flag is the point: every
+# one of these has a non-interactive form, and the message names it. `npm init
+# -y`, `gh auth login --with-token`, `ssh-keygen -N ''`.
+#
+# `aws configure` uses the `args.1` trick — the bare command prompts for four
+# values in a row, while every subcommand of it (`list`, `get`, `set`) is
+# non-interactive and passes.
+[[rules]]
+name = "no-setup-wizard"
+description = "A wizard reads from stdin, and there is no stdin here."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["npm", "pnpm", "yarn"] }
+"args.0" = { any_of = ["init", "login", "adduser"] }
+args = { none_of = ["-y", "--yes", "--with-token"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["gh"] }
+"args.0" = { any_of = ["auth"] }
+"args.1" = { any_of = ["login", "refresh"] }
+args = { none_of = ["--with-token"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["aws", "gcloud", "doctl"] }
+"args.0" = { any_of = ["configure", "init"] }
+"args.1" = { none_glob = ["*"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["ssh-keygen", "gpg"] }
+args = { none_of = ["-N", "--batch", "--passphrase"] }
+
+[rules.action]
+kind = "deny"
+message = """
+This prompts for input that nothing here can supply, and some of these write a \
+partial config before they get to the prompt.
+
+Every one has a non-interactive form:
+
+  npm init -y
+  gh auth login --with-token < token.txt
+  aws configure set region eu-west-1
+  ssh-keygen -t ed25519 -N '' -f ./key
+
+Anything that genuinely needs a human — an OAuth flow, a passphrase — is the \
+user's to run."""
+
+[rules.test]
+fires = ["npm init", "gh auth login", "aws configure", "ssh-keygen -t ed25519"]
+ignores = ["npm init -y", "gh auth status", "aws configure set region eu-west-1", "ssh-keygen -t ed25519 -N '' -f ./key"]

@@ -31,7 +31,7 @@ pub fn suggest_cmd(
     let shapes = replay::shapes(&entries);
 
     // Weighing a pair takes the rule that denied, not just the two log lines.
-    let ruleset = config::load(&std::env::current_dir()?)?;
+    let ruleset = config::load(&std::env::current_dir()?, config::Origin::Stack)?;
 
     let mut closed: Vec<&replay::Escape> = Vec::new();
     let mut weak: Vec<&replay::Escape> = Vec::new();

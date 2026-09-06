@@ -1,0 +1,273 @@
+# Workflow conventions.
+#
+# Nothing here is compiled into the binary, and installing steer does not turn
+# any of it on. Copy what you want into `~/.config/steer/config.toml` or a repo
+# `.steer.toml`, and leave the rest.
+#
+#   steer check --config examples/workflow.toml 'git add .'
+#   steer validate --config examples/workflow.toml
+#
+# None of these guard against harm. They encode habits, which makes them the
+# most personal file here — `no-staging` in particular is a house rule, not a
+# widely held one.
+#
+# `lockfile-is-generated` matches Claude Code's tool names and never fires
+# under Codex. It also ships without `[rules.test]`: examples are Bash command
+# lines, so a rule gated on another tool cannot declare any.
+
+
+# A scope control rather than a security one. An agent that wanders into a
+# sibling checkout makes changes nobody is reviewing, in a repo whose tests are
+# not the ones about to run.
+#
+# `in_workspace` does the work, and its default is what makes the rule usable:
+# a segment naming no path at all counts as inside, so `cargo build`,
+# `git status`, and `brew install jq` all pass. Only a command that actually
+# reaches somewhere else is caught.
+#
+# This is the broadest rule in the file. `cat /etc/hosts` and `ls ~/Downloads`
+# both fire. If that is not what you want, add a `head` condition and let the
+# rest through.
+[[rules]]
+name = "stay-in-workspace"
+description = "Reads and writes stay inside the session's working tree."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+in_workspace = { is = false }
+
+[rules.action]
+kind = "deny"
+message = """
+That path is outside the working tree for this session.
+
+Everything the task needs should be in the repo. If it genuinely is not — a \
+sibling checkout, a file in the home directory — ask rather than reaching for \
+it: the user knows whether that tree is one you should be touching."""
+
+# Relative paths only. An absolute one would be inside the tree for anyone
+# running validate from `/`.
+[rules.test]
+fires = ["ls ../other-repo", "cat ../../notes.md"]
+ignores = ["cargo build", "git status", "ls src", "brew install jq"]
+
+
+# Staging is where the user decides what the change actually is. An agent that
+# stages on its own removes that decision, usually by picking up a debug print
+# or a scratch file alongside the work.
+#
+# The un-stage direction is deliberately untouched: `git rm --cached` and
+# `git restore --staged` take things out of the index, which is not a decision
+# being made on the user's behalf.
+#
+# Overlaps `no-committing-secrets` in examples/secrets.toml on `git add`.
+# Taking both is fine; taking this one makes that rule's `add` half redundant.
+[[rules]]
+name = "no-staging"
+description = "What goes in a commit is the user's call."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["add", "stage"] }
+
+[rules.action]
+kind = "deny"
+message = """
+Staging is the user's call — it is where they decide what the commit contains.
+
+Leave the changes in the working tree and say what you changed. `git status` \
+and `git diff` are both fine, and are usually what was actually wanted."""
+
+[rules.test]
+fires = ["git add src/main.rs", "git add -A", "git add ."]
+ignores = ["git status", "git diff", "git rm --cached .env", "git restore --staged src/main.rs"]
+
+
+# A hand-edited lockfile is a lie about what resolved. It survives until the
+# next install rewrites it, and in the meantime CI and the local tree disagree
+# about what is installed for reasons nobody can see in the diff.
+#
+# Only Edit and Write are matched. The package manager rewrites these files
+# constantly and does it through its own process, which steer never sees.
+[[rules]]
+name = "lockfile-is-generated"
+description = "Lockfiles are output; editing one desynchronises it from the manifest."
+
+[[rules.match]]
+tool_name = { any_of = ["Edit", "Write", "NotebookEdit"] }
+file_path = { glob = ["*Cargo.lock", "*package-lock.json", "*pnpm-lock.yaml", "*yarn.lock", "*go.sum", "*poetry.lock", "*uv.lock", "*Gemfile.lock", "*composer.lock"] }
+
+[rules.action]
+kind = "deny"
+message = """
+A lockfile is generated. Editing it by hand makes it disagree with the \
+manifest until something regenerates it, and the disagreement is invisible in \
+review.
+
+Change the manifest and let the tool resolve: `cargo add`, `npm install`, \
+`go mod tidy`, `uv lock`."""
+
+
+# A dev server started inside a tool call outlives the call. Nothing stops it,
+# the port stays taken, and the next run fails for a reason that has nothing to
+# do with the code.
+#
+# The discriminator is the script name rather than the runner, since `npm run`
+# is how everything is spelled. Watch modes are here for the same reason a
+# server is: both hold the terminal and neither ever finishes.
+[[rules]]
+name = "no-background-servers"
+description = "A server started in a tool call is never stopped."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["npm", "pnpm", "yarn", "bun"] }
+"args.0" = { any_of = ["run", "start", "dev"] }
+args = { any_of = ["dev", "start", "serve", "watch", "storybook"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["cargo"] }
+"args.0" = { any_of = ["watch"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["vite", "nodemon", "webpack-dev-server", "rails"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["python", "python3"] }
+args = { any_of = ["http.server", "SimpleHTTPServer"] }
+
+[rules.action]
+kind = "deny"
+message = """
+A server started here keeps running after the call returns, holds its port, \
+and nobody stops it.
+
+If the change needs checking against a running app, ask — the user starts it \
+in their own terminal, where they can see it and kill it. A build \
+(`npm run build`) or a single test run answers most of what a dev server is \
+being reached for."""
+
+[rules.test]
+fires = ["npm run dev", "pnpm start", "cargo watch -x test", "python3 -m http.server 8000"]
+ignores = ["npm run build", "npm test", "cargo build", "python3 scripts/gen.py"]
+
+
+# The hooks are the checks the repo asked for. Skipping them moves the failure
+# from a place where it is cheap to a place where it is public.
+#
+# Worth reading for the `-n` handling alone: on `commit` it is `--no-verify`,
+# on `push` it is `--dry-run`. Same flag, opposite risk, which is why the two
+# blocks do not share a list — `git push -n` is one of the safest things in
+# this file and belongs in `ignores`.
+[[rules]]
+name = "commit-no-verify"
+description = "Pre-commit hooks are the checks the repo asked for."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["commit"] }
+args = { any_of = ["--no-verify", "-n"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["push"] }
+args = { any_of = ["--no-verify"] }
+
+[rules.action]
+kind = "deny"
+message = """
+The hooks are what the repo uses to keep formatting, lint, and tests honest, \
+and skipping them just moves the failure into CI.
+
+If a hook is failing, fix what it reports. If the hook itself is broken, say \
+so — that is a repo problem worth someone knowing about, not one to route \
+around per commit."""
+
+[rules.test]
+fires = ["git commit --no-verify -m fix", "git commit -n -m fix", "git push --no-verify"]
+ignores = ["git commit -m fix", "git push -n", "git push origin main"]
+
+
+# Machine-wide git settings outlive the session, the repo, and the task. A
+# `user.email` set globally to get one commit through is still there a month
+# later, signing work in a repo nobody was thinking about.
+#
+# Reading is fine and stays fine — `none_of` keeps the query forms out, since
+# `git config --global --list` answers a question rather than changing
+# anything.
+[[rules]]
+name = "no-git-config-global"
+description = "Machine-wide git settings outlive the task that wanted them."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["config"] }
+args = { any_of = ["--global", "--system"], none_of = ["--list", "--get", "--get-all", "-l"] }
+
+[rules.action]
+kind = "deny"
+message = """
+This changes git for every repo on the machine, and it will still be set long \
+after this task is done.
+
+Set it for this repo instead — `git config user.email …` with no `--global` — \
+or pass it for one command with `git -c user.email=… commit`. Reading the \
+global config (`git config --global --list`) is fine."""
+
+[rules.test]
+fires = ["git config --global user.email me@example.com", "git config --system core.editor vim"]
+ignores = ["git config --global --list", "git config user.email me@example.com", "git config --get remote.origin.url"]
+
+
+# The mildest rule here: a note, not a refusal. A full-suite run on every edit
+# is slow enough to change how the work goes, and the failures it surfaces are
+# usually not the ones the change caused.
+#
+# `args.1` is absent for a bare `cargo test`, and a path that resolves to
+# nothing passes a negative operator — which is how "took no argument beyond
+# the subcommand" gets written. `cargo test --lib` has a flag there and does
+# not fire, which is the right call: a scoped run is a scoped run.
+[[rules]]
+name = "targeted-tests"
+description = "A whole-suite run is rarely the question being asked."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["cargo"] }
+"args.0" = { any_of = ["test"] }
+"args.1" = { none_glob = ["*"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["go"] }
+"args.0" = { any_of = ["test"] }
+args = { any_of = ["./..."] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["pytest", "jest", "vitest"] }
+args = { none_glob = ["*"] }
+
+[rules.action]
+kind = "context"
+message = """
+steer: this runs the whole suite. If the question is whether a specific change \
+works, the tests covering it answer faster and their failures are yours — \
+`cargo test <name>`, `go test ./pkg/...`, `pytest tests/test_x.py`."""
+
+[rules.test]
+fires = ["cargo test", "go test ./...", "pytest"]
+ignores = ["cargo test parses_heredoc", "cargo test --lib", "go test ./rules/...", "pytest tests/test_rules.py"]

@@ -11,18 +11,22 @@ use crate::rules::Outcome;
 use crate::{config, rules, shell};
 use anyhow::{bail, Result};
 use serde_json::json;
+use std::path::Path;
 
 // Harness-agnostic on purpose: what a rule matches is the question here, and
 // that does not change between harnesses. The `agents` gate, and the rendering
 // that follows from it, belong to the hook path.
-pub fn check(rest: &[String]) -> Result<i32> {
+pub fn check(rest: &[String], only: Option<&Path>) -> Result<i32> {
     let command = rest.join(" ");
     // `required` guarantees an argument, not a non-empty one.
     if command.trim().is_empty() {
         bail!("check requires a command, e.g. steer check 'grep -rn foo src'");
     }
     let cwd = std::env::current_dir()?;
-    let ruleset = config::load(&cwd)?;
+    let ruleset = config::load(
+        &cwd,
+        only.map_or(config::Origin::Stack, config::Origin::Only),
+    )?;
     let tool_input = json!({ "command": command });
 
     let ink = Ink::new();

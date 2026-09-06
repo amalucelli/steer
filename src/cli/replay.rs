@@ -15,7 +15,7 @@ use anyhow::Result;
 pub fn replay_cmd(since: Option<u64>) -> Result<i32> {
     let entries = super::history(since)?;
     let ink = Ink::new();
-    let ruleset = config::load(&std::env::current_dir()?)?;
+    let ruleset = config::load(&std::env::current_dir()?, config::Origin::Stack)?;
     let changes = replay::replay(&entries, &ruleset);
 
     let mut stopped: Vec<&replay::Change> = Vec::new();

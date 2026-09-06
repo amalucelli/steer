@@ -1,0 +1,219 @@
+# Outward-facing actions.
+#
+# Nothing here is compiled into the binary, and installing steer does not turn
+# any of it on. Copy what you want into `~/.config/steer/config.toml` or a repo
+# `.steer.toml`, and leave the rest.
+#
+#   steer check --config examples/outward.toml 'npm publish'
+#   steer validate --config examples/outward.toml
+#
+# Different from destructive.toml, and the difference is worth holding onto.
+# Those rules guard things that can be lost. These guard things that can be
+# seen: a yanked version is still a version somebody downloaded, a closed pull
+# request still sent its notification, and a deleted comment was still read.
+# Nothing here is undoable, because the part that matters already happened
+# somewhere you do not control.
+
+
+# A published version is permanent even when it is yanked — the registry keeps
+# the record, mirrors keep the tarball, and anyone who resolved it in between
+# has it in a lockfile.
+#
+# `--dry-run` is the escape, and it is the one that makes the rule teachable:
+# there is a way to answer "would this publish work" that does not publish, and
+# denying the real thing points at it.
+#
+# `git push` is not here. It has its own built-in, and pushing a branch is not
+# in the same class as putting a version on a registry.
+[[rules]]
+name = "no-publish"
+description = "A published version is permanent, including the ones you yank."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["npm", "pnpm", "yarn", "bun", "cargo", "gem", "poetry", "twine", "docker", "helm"] }
+"args.0" = { any_of = ["publish", "push", "upload"] }
+args = { none_of = ["--dry-run", "-n"] }
+
+[rules.action]
+kind = "deny"
+message = """
+Publishing is not reversible. Yanking removes the version from resolution, not \
+from the registry, the mirrors, or the lockfiles that already picked it up.
+
+Check it without shipping it: `npm publish --dry-run`, `cargo publish \
+--dry-run`, `npm pack` to see exactly what would go in the tarball. The \
+release itself is the user's to run, and usually belongs in CI on a tag \
+rather than on a laptop."""
+
+[rules.test]
+fires = ["npm publish", "cargo publish", "twine upload dist/*", "docker push registry.test/app:1.0"]
+ignores = ["npm publish --dry-run", "cargo publish --dry-run", "npm pack", "cargo build"]
+
+
+# Everything here is a state change other people can see, on infrastructure
+# nobody in this session owns. A merged pull request has already run CI, moved
+# a branch, and notified reviewers; a deleted repository takes its issues with
+# it.
+#
+# `gh pr create` is deliberately absent. A pull request is reviewable and can be
+# closed, which makes it the one outward action in this file that costs nothing
+# to get wrong — and an agent that can open one is considerably more useful.
+#
+# Known ceiling: `gh` reads `GH_REPO` from the environment, so nothing in the
+# command line says which repository is about to change.
+[[rules]]
+name = "no-release-or-merge"
+description = "Merges, releases, and repository deletion are the user's to run."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["gh"] }
+"args.0" = { any_of = ["pr"] }
+"args.1" = { any_of = ["merge", "close", "ready"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["gh"] }
+"args.0" = { any_of = ["release"] }
+"args.1" = { any_of = ["create", "delete", "edit", "upload"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["gh"] }
+"args.0" = { any_of = ["repo"] }
+"args.1" = { any_of = ["delete", "archive", "rename"] }
+
+[rules.action]
+kind = "deny"
+message = """
+This changes something on GitHub that other people are watching, and it is not \
+a change to take on someone's behalf.
+
+Everything up to it is fine: `gh pr create` opens the pull request, `gh pr \
+checks` reports CI, `gh pr diff` shows what would land. Say the merge is \
+ready and let the user press the button."""
+
+[rules.test]
+fires = ["gh pr merge 42 --squash", "gh release create v1.2.0", "gh repo delete acme/app"]
+ignores = ["gh pr create --title fix --body x", "gh pr list", "gh pr checks 42", "gh release list"]
+
+
+# These post under the user's identity. Whatever gets written carries their
+# name on it, arrives as a notification, and is read long before anyone thinks
+# to delete it.
+#
+# The second block is the same act without an API: a webhook is a message to a
+# room full of people, and the URL is the only thing identifying it as one. It
+# matches an `-X POST` and a known webhook host together — both operators live
+# on `args`, so they are ANDed across one array without either needing to know
+# where in the line the other landed.
+[[rules]]
+name = "no-post-as-user"
+description = "Comments and messages carry the user's name and arrive as notifications."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["gh"] }
+"args.0" = { any_of = ["pr", "issue"] }
+"args.1" = { any_of = ["comment", "review", "edit", "reopen"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["curl", "http", "https"] }
+args = { any_of = ["-X", "--request", "-d", "--data"], glob = ["*hooks.slack.com*", "*discord.com/api/webhooks*", "*api.telegram.org*", "*events.pagerduty.com*"] }
+
+[rules.action]
+kind = "deny"
+message = """
+This posts under the user's account and notifies whoever is subscribed. \
+Deleting it afterwards does not unsend the notification.
+
+Write the comment out and let them post it, or put it in the pull request body \
+where it is part of the change rather than a separate message. Reading is \
+fine: `gh pr view`, `gh issue view`, `gh pr diff`."""
+
+[rules.test]
+fires = ["gh pr comment 42 --body 'fixed'", "gh issue comment 7 --body x", "curl -X POST https://hooks.slack.com/services/T/B/X -d @msg.json"]
+ignores = ["gh pr view 42", "gh issue list", "curl -X POST https://api.internal.test/v1/jobs -d @job.json"]
+
+
+# A tag is a promise about a specific commit. Moving or deleting one that has
+# been fetched leaves every clone disagreeing about what the version was, and
+# the disagreement is silent — nothing re-fetches a tag it already has.
+#
+# The same goes for deleting a remote branch, which is `git push` wearing a
+# flag rather than a subcommand of its own.
+#
+# Local-only tag work passes: `git tag v1.0.0` creates one and `git tag -l`
+# lists them. The rule is about the ones that have already left.
+[[rules]]
+name = "no-tag-rewrite"
+description = "A published tag is a promise; moving one breaks every clone silently."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["tag"] }
+args = { any_of = ["-d", "--delete", "-f", "--force"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["push"] }
+args = { any_of = ["-d", "--delete"] }
+
+[rules.action]
+kind = "deny"
+message = """
+A tag that has been fetched does not get re-fetched, so moving or deleting one \
+leaves clones quietly disagreeing about which commit a version is.
+
+If the release was wrong, cut the next one. If the tag was never pushed, say \
+so and it can go locally. Deleting a remote branch is the same conversation — \
+the user knows whether anything still points at it."""
+
+[rules.test]
+fires = ["git tag -d v1.0.0", "git tag -f v1.0.0 HEAD", "git push origin --delete feature-x"]
+ignores = ["git tag v1.0.0", "git tag -l", "git push origin main", "git tag -a v1.0.0 -m release"]
+
+
+# A deploy puts code in front of users. Everything else in this file can be
+# argued as recoverable if you move fast enough; this one is serving traffic
+# before the command returns.
+#
+# Preview deploys are matched too, deliberately. A preview URL is public, gets
+# indexed, and is a link somebody can send on — the difference from production
+# is scale, not visibility.
+#
+# Known ceiling: these tools all read their target from a project file or an
+# environment variable, so the command line rarely says where it is going. The
+# rule matches the act, not the destination.
+[[rules]]
+name = "no-deploy"
+description = "A deploy is serving traffic before the command returns."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["vercel", "netlify", "fly", "flyctl", "wrangler", "sls", "serverless", "eb", "pulumi"] }
+args = { any_of = ["deploy", "publish", "up", "--prod", "--production"] }
+
+[rules.action]
+kind = "deny"
+message = """
+This ships code to something people can reach, and it is live before the \
+command finishes.
+
+Build locally and check the output first — most of these have a local mode \
+(`vercel dev`, `wrangler dev`, `netlify dev`) that answers whether it works \
+without putting it anywhere. The deploy itself belongs to the user, or to CI \
+on a merged branch."""
+
+[rules.test]
+fires = ["vercel --prod", "netlify deploy --prod", "fly deploy", "wrangler deploy"]
+ignores = ["vercel dev", "netlify dev", "fly status", "wrangler tail"]

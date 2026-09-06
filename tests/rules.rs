@@ -1412,6 +1412,82 @@ fires = ["psql -h prod"]
     assert!(is_denied(&decision(&sandbox, "psql -h prod")), "{out}");
 }
 
+// `--config` names the whole ruleset rather than a fourth layer on the stack,
+// which is what makes a rule file checkable on its own. The built-ins and the
+// global config are not switched off here — they never load — so the report has
+// to read as a replacement rather than as something with a stack behind it.
+#[test]
+fn a_named_config_stands_in_for_the_whole_stack() {
+    let sandbox = Sandbox::new("onlyconfig");
+    sandbox.write_global(
+        r#"
+[[rules]]
+name = "from-the-global"
+tool = "Bash"
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["psql"] }
+[rules.action]
+kind = "deny"
+message = "not against prod"
+"#,
+    );
+    // `builtins = false` has nothing left to switch off, so it says nothing.
+    let body = r#"
+builtins = false
+
+[[rules]]
+name = "only-this"
+tool = "Bash"
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["ruby"] }
+[rules.action]
+kind = "deny"
+message = "Use the Edit tool."
+[rules.test]
+fires = ["ruby script.rb"]
+ignores = ["rake build"]
+"#;
+    let only = sandbox.dir.join("only.toml");
+    fs::write(&only, body).expect("write named config");
+    let path = only.display().to_string();
+
+    let (out, code) = cli(&sandbox, &["validate", "--config", &path]);
+    assert_eq!(code, 0, "the file's own examples still run: {out}");
+    assert!(out.contains(&format!("source    {path}")), "{out}");
+    assert!(out.contains("ok        1 rules"), "{out}");
+    assert!(!out.contains("built-in"), "nothing under it: {out}");
+    assert!(!out.contains("from-the-global"), "nothing over it: {out}");
+    assert!(!out.contains("turned off"), "nothing to turn off: {out}");
+
+    let (out, code) = cli(&sandbox, &["check", "--config", &path, "ruby script.rb"]);
+    assert_eq!(code, 1, "{out}");
+    let (out, code) = cli(&sandbox, &["check", "--config", &path, "grep -rn foo src"]);
+    assert_eq!(
+        code, 0,
+        "gone from the decision, not just the report: {out}"
+    );
+
+    // A `disable` is answered by this file alone, so naming an inherited rule
+    // is the same unresolved name it has always been.
+    fs::write(&only, format!("disable = [\"fff-over-grep\"]\n{body}")).expect("rewrite config");
+    let (out, code) = cli(&sandbox, &["validate", "--config", &path]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("disable names `fff-over-grep`, which no rule defines"),
+        "{out}"
+    );
+
+    // A ruleset that is not there is not a reason to load the one it replaced.
+    let (out, code) = cli(
+        &sandbox,
+        &["validate", "--config", "/nonexistent/steer.toml"],
+    );
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("/nonexistent/steer.toml"), "{out}");
+}
+
 // An example that stops being true has to fail, or it is just a comment.
 #[test]
 fn validate_runs_the_examples_a_rule_declares() {
@@ -1610,7 +1686,7 @@ message = "x"
     );
     // Piped output carries no escapes, so it stays greppable.
     assert!(!out.contains('\u{1b}'), "{out}");
-    assert!(out.contains("ok        4 rules"), "{out}");
+    assert!(out.contains("ok        7 rules"), "{out}");
 }
 
 #[test]

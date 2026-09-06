@@ -72,6 +72,15 @@ pub struct Source {
     pub builtin: bool,
 }
 
+#[derive(Clone, Copy)]
+pub enum Origin<'a> {
+    Stack,
+    /// One file, standing in for the whole stack rather than layering on it:
+    /// nothing compiled in and nothing found by walking up takes part, so the
+    /// file's own `builtins` key has nothing left to switch off.
+    Only(&'a Path),
+}
+
 /// A rule written back out as TOML, in the shape the config files use. Whole
 /// rule, never a fragment: a later source can only replace a rule of the same
 /// name, not add to it, so a draft is pasteable only if it carries everything.
@@ -288,7 +297,18 @@ pub fn overlay_path(cwd: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-pub fn sources(cwd: &Path) -> Result<Vec<Source>> {
+pub fn sources(cwd: &Path, origin: Origin) -> Result<Vec<Source>> {
+    if let Origin::Only(path) = origin {
+        // The stack passes over a file that is not there; here there is nothing
+        // to carry on from.
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        return Ok(vec![Source {
+            label: path.display().to_string(),
+            text,
+            builtin: false,
+        }]);
+    }
     let mut sources = vec![Source {
         label: BUILTIN_LABEL.into(),
         text: BUILTIN.to_string(),
@@ -320,8 +340,8 @@ type Parse = (Source, Result<ConfigFile, toml::de::Error>);
 /// they take part is said after them, so it cannot be settled inside a walk over
 /// the sources. A source that does not parse cannot turn them off, and the
 /// caller that cares reports the parse failure on its own.
-fn parsed(cwd: &Path) -> Result<(Vec<Parse>, bool)> {
-    let files: Vec<Parse> = sources(cwd)?
+fn parsed(cwd: &Path, origin: Origin) -> Result<(Vec<Parse>, bool)> {
+    let files: Vec<Parse> = sources(cwd, origin)?
         .into_iter()
         .map(|source| {
             let file = toml::from_str(&source.text);
@@ -334,12 +354,12 @@ fn parsed(cwd: &Path) -> Result<(Vec<Parse>, bool)> {
     Ok((files, builtins))
 }
 
-pub fn load(cwd: &Path) -> Result<Vec<Rule>> {
+pub fn load(cwd: &Path, origin: Origin) -> Result<Vec<Rule>> {
     let mut specs: Vec<RuleSpec> = Vec::new();
     let mut disabled: Vec<String> = Vec::new();
     let mut amendments: Vec<Amendment> = Vec::new();
 
-    let (files, builtins) = parsed(cwd)?;
+    let (files, builtins) = parsed(cwd, origin)?;
     for (source, file) in files {
         let file = file.with_context(|| format!("parsing {}", source.label))?;
         disabled.extend(file.disable);
@@ -400,7 +420,7 @@ pub struct Report {
 /// takes one edit to fix instead of one per round trip. The layers come back
 /// alongside them: what each source declared is what makes an override or a
 /// disable readable, and it is gone once `load` has stacked them.
-pub fn inspect(cwd: &Path) -> Result<Report> {
+pub fn inspect(cwd: &Path, origin: Origin) -> Result<Report> {
     #[derive(Deserialize)]
     struct Located {
         #[serde(default)]
@@ -445,7 +465,7 @@ pub fn inspect(cwd: &Path) -> Result<Report> {
     // follow the definition that is actually live.
     let mut examples: BTreeMap<String, Vec<Example>> = BTreeMap::new();
 
-    let (files, builtins) = parsed(cwd)?;
+    let (files, builtins) = parsed(cwd, origin)?;
 
     for (source, file) in files {
         let file = match file {
@@ -684,7 +704,7 @@ mod tests {
     #[test]
     fn builtins_compile() {
         let file: ConfigFile = toml::from_str(BUILTIN).expect("parse built-ins");
-        assert_eq!(file.rules.len(), 5);
+        assert_eq!(file.rules.len(), 8);
         for spec in file.rules {
             Rule::compile(spec).expect("compile built-in");
         }

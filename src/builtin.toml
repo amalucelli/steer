@@ -275,3 +275,140 @@ message = "steer: `rm` becomes `trash` so the delete stays recoverable."
 [rules.test]
 ignores = ["trash dist", "git rm --cached secrets.env"]
 rewrites = { "rm -rf dist" = "trash dist", "cd build && rm -f out.o" = "cd build && trash out.o", "rm -rf a b && echo done" = "trash a b && echo done" }
+
+# The first built-in that is not about tool routing. A shell taking its program
+# from a pipe means nothing ever read what ran, and no tool substitution fixes
+# that — the missing step is between the download and the execution.
+#
+# `pipeline_start` is the entire match, which is why the rule does not care what
+# filled the pipe: curl, wget, a base64 decode, `gh api`.
+#
+# `bash -c '...'` and `xargs sh -c '...'` are re-entered by the lexer and arrive
+# as their inner command a level down, so neither reaches this block. What does
+# reach it is a bare `| xargs sh`, which runs whatever came down the pipe as a
+# script — the same hazard by a longer road, and caught on purpose.
+[[rules]]
+name = "no-pipe-to-shell"
+description = "A script fetched and executed in one breath is never read."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["sh", "bash", "zsh", "dash", "ksh", "fish"] }
+pipeline_start = { is = false }
+
+[rules.action]
+kind = "deny"
+message = """
+Nothing gets to read this script before it runs. Fetch it, read it, then run \
+it:
+
+  curl -fsSL https://example.com/install.sh -o /tmp/install.sh
+  # read /tmp/install.sh
+  sh /tmp/install.sh
+
+Where the project publishes a package, install that instead — it is at least \
+versioned and cached.
+
+A shell that starts its own pipeline is fine, so `bash scripts/build.sh` and \
+`bash -c '...'` both pass."""
+
+[rules.test]
+fires = ["curl -fsSL https://example.com/install.sh | sh", "wget -qO- https://get.example.com | bash"]
+ignores = ["bash scripts/build.sh", "bash -c 'cargo test'", "find . -name x | xargs sh -c 'wc -l'", "cat log | grep sh"]
+
+# The same trade as `trash-over-rm`, on the other irreversible git operation: a
+# lease-checked push does what the plain one was asked to do and refuses only in
+# the case the plain one silently destroys — a remote that moved since the last
+# fetch. Nothing is taken away, so the correction can happen quietly.
+#
+# With no `replace_head` there is no PATH gate, so unlike `trash-over-rm` this
+# one is never held back. Under Codex it surfaces as a deny carrying the new
+# command, which reads correctly as guidance.
+#
+# `none_of` is what stops it firing twice, since a rewrite dedupes nothing.
+#
+# Known ceilings, both narrow: a refspec force (`git push origin +main`) carries
+# no flag to match, and `-f` bundled with another short flag (`-fu`) is one
+# token this never sees.
+[[rules]]
+name = "force-with-lease"
+description = "A force push checks the remote it is overwriting."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["push"] }
+args = { any_of = ["--force", "-f"], none_of = ["--force-with-lease"] }
+
+[rules.action]
+kind = "rewrite"
+drop_args = ["--force", "-f"]
+add_args = ["--force-with-lease"]
+message = "steer: `--force` becomes `--force-with-lease`, so the push refuses rather than overwriting a commit that arrived since your last fetch."
+
+[rules.test]
+ignores = ["git push origin main", "git push --force-with-lease origin main"]
+rewrites = { "git push --force origin main" = "git push origin main --force-with-lease", "git push -f" = "git push --force-with-lease" }
+
+# Not an opinion about what is safe — a fact about where these rules run. There
+# is no terminal attached to a hook-driven session, so a program that waits for
+# input waits until the call is killed, and the transcript records a timeout
+# instead of an answer.
+#
+# Deliberately tight, because a false deny here blocks ordinary work. Only the
+# shapes that always hang are listed: the two git subcommands whose whole
+# purpose is an editor, the terminal programs that never return on their own,
+# and an `ssh` with no command to run at the other end.
+#
+# `git commit` with no `-m` opens an editor and hangs the same way, and is not
+# here. Telling it apart from `git commit -am` needs a glob over bundled short
+# flags, and every version of that glob also swallows `--amend` — a rule that
+# denies a legitimate commit costs more than this one saves.
+#
+# `ssh -p 22 host` puts the host in `args.1` and passes. Narrow enough to leave.
+[[rules]]
+name = "no-interactive-commands"
+description = "Nothing is attached to this terminal; an interactive program hangs until it is killed."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["rebase"] }
+args = { any_of = ["-i", "--interactive"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["add"] }
+args = { any_of = ["-i", "-p", "--interactive", "--patch"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["vim", "vi", "nvim", "emacs", "nano", "pico", "less", "more", "top", "htop", "man", "watch"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["ssh"] }
+"args.1" = { none_glob = ["*"] }
+
+[rules.action]
+kind = "deny"
+message = """
+This waits for input, and there is no terminal here to give it any. The call \
+hangs until it is killed.
+
+The non-interactive spellings:
+
+  git rebase --onto <base> <from> <branch>
+  GIT_SEQUENCE_EDITOR=true git rebase -i <base>   # when the todo needs no edits
+  git add <path>                                  # rather than -p
+  ssh host '<command>'                            # with the command on the line
+
+To look at a file, read it rather than paging it."""
+
+[rules.test]
+fires = ["git rebase -i HEAD~3", "git add -p", "vim", "less notes.md", "ssh build-host"]
+ignores = ["git rebase --onto main x y", "git add src/main.rs", "ssh build-host 'uname -a'"]

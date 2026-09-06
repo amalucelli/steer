@@ -84,7 +84,7 @@ fn main() {
     // developer tools and should say so loudly when something is wrong.
     let result = match cli.command {
         Sub::Hook { event, agent } => std::process::exit(run_hook(event, agent)),
-        Sub::Check { command } => cli::check(&command),
+        Sub::Check { config, command } => cli::check(&command, config.as_deref()),
         Sub::Replay { since } => cli::replay_cmd(since),
         Sub::Suggest {
             since,
@@ -92,7 +92,7 @@ fn main() {
             draft,
             all,
         } => cli::suggest_cmd(since, apply, draft, all),
-        Sub::Validate => cli::validate(),
+        Sub::Validate { config } => cli::validate(config.as_deref()),
         Sub::Init => cli::init(),
     };
 

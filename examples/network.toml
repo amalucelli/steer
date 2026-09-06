@@ -1,0 +1,162 @@
+# Network and supply chain.
+#
+# Nothing here is compiled into the binary, and installing steer does not turn
+# any of it on. Copy what you want into `~/.config/steer/config.toml` or a repo
+# `.steer.toml`, and leave the rest.
+#
+#   steer check --config examples/network.toml 'curl -sk https://x.test'
+#   steer validate --config examples/network.toml
+#
+# `no-pipe-to-shell` used to live here and is now a built-in, active with no
+# config at all.
+#
+# `webfetch-allowlist` matches Claude Code's tool names and never fires under
+# Codex. It also ships without `[rules.test]`: examples are Bash command lines,
+# so a rule gated on another tool cannot declare any.
+
+
+# Turning off certificate verification is almost never the fix. It is what a
+# model reaches for when a proxy is misconfigured or a clock is wrong, and it
+# converts a loud failure into a silent one that stays off for every later
+# request.
+#
+# The regex is the interesting part. Long options are immune to `^-[a-zA-Z]*k`
+# by construction — the class cannot match the second dash — so `--key` and
+# `--keepalive-time` pass while `-k`, `-sk`, and `-kL` all match. Bundled short
+# flags are the only reason this is a regex rather than an `any_of`.
+#
+# The second block is the environment-variable spelling of the same thing, and
+# the only rule here that reads `wrappers`. A leading `VAR=value` is peeled off
+# the segment during enrichment, so it is not in `args` and there is nowhere
+# else to find it.
+[[rules]]
+name = "no-insecure-tls"
+description = "Certificate verification stays on."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["curl", "wget", "http", "https"] }
+args = { matches = "^-[a-zA-Z]*k$|^--insecure$|^--no-check-certificate$" }
+
+[[rules.match]]
+any = "parsed.segments"
+wrappers = { glob = ["GIT_SSL_NO_VERIFY=*", "NODE_TLS_REJECT_UNAUTHORIZED=0", "PYTHONHTTPSVERIFY=0", "CURL_INSECURE=*"] }
+
+[rules.action]
+kind = "deny"
+message = """
+Skipping certificate verification hides the problem rather than solving it, \
+and what it hides is exactly the case this check exists for.
+
+If the certificate is self-signed on purpose, point at it — `curl --cacert \
+ca.pem`, `git -c http.sslCAInfo=ca.pem`. If it is a corporate proxy, its CA \
+belongs in the trust store. If it is an expired certificate on someone else's \
+host, that is worth reporting rather than working around."""
+
+[rules.test]
+fires = ["curl -sk https://x.test", "wget --no-check-certificate https://x.test", "GIT_SSL_NO_VERIFY=true git clone https://x.test/r"]
+ignores = ["curl -sL https://x.test", "curl --key client.pem https://x.test", "wget -q https://x.test"]
+
+
+# A registry override is where a supply-chain attack gets its packages from,
+# and it is one flag long. The names resolve, the versions look right, and the
+# code comes from somewhere else entirely.
+#
+# `--registry=http://host` arrives as a single argument, so this matches the
+# flag with a glob rather than `any_of` — which then covers both spellings,
+# since `--registry http://host` puts the flag in its own element too.
+#
+# `localhost` is the escape that matters: a local Verdaccio or devpi is the
+# ordinary reason to override a registry, and denying it makes the rule
+# unusable in the repos that need it most.
+[[rules]]
+name = "no-untrusted-registry"
+description = "Packages come from the registry the project declares."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "cargo", "gem"] }
+args = { glob = ["--registry*", "--index-url*", "--extra-index-url*"], none_glob = ["*registry.npmjs.org*", "*pypi.org*", "*crates.io*", "*rubygems.org*", "*localhost*", "*127.0.0.1*"] }
+
+[rules.action]
+kind = "deny"
+message = """
+This installs from a registry the project does not declare, which is where a \
+substituted package comes from.
+
+If the override is deliberate, it belongs in the project's config — \
+`.npmrc`, `pip.conf`, `.cargo/config.toml` — where it is reviewable and \
+applies to everyone, rather than on one command line.
+
+A registry on localhost is fine and passes."""
+
+[rules.test]
+fires = ["npm install --registry=http://packages.internal.test", "pip install requests --index-url https://mirror.test/simple"]
+ignores = ["npm install --registry=https://registry.npmjs.org", "npm install --registry=http://localhost:4873", "npm install left-pad", "pip install requests"]
+
+
+# An allowlist rather than a blocklist, because the failure this guards is a
+# fetch of something nobody vetted, and you cannot enumerate that.
+#
+# Replace the hosts with your own before taking this rule. The list below is an
+# example of the shape, not a recommendation — an allowlist someone else wrote
+# is either too tight to work or too loose to matter.
+#
+# Note the trailing `/*` on each entry. `https://github.com*` would also admit
+# `https://github.com.evil.test`, which is the one mistake this pattern exists
+# to avoid.
+[[rules]]
+name = "webfetch-allowlist"
+description = "Fetches go to hosts the config names."
+tool = "WebFetch"
+
+[[rules.match]]
+url = { none_glob = ["https://docs.rs/*", "https://doc.rust-lang.org/*", "https://github.com/*", "https://raw.githubusercontent.com/*", "https://*.github.io/*"] }
+
+[rules.action]
+kind = "deny"
+message = """
+That host is not on the fetch allowlist.
+
+If the page is needed, add the host to `webfetch-allowlist` in the steer \
+config. If the answer is likely to be in the repo or in a dependency already \
+vendored, look there first."""
+
+
+# Not a denial — a note. An unpinned install resolves to whatever the registry
+# serves at that moment, which is how a compromised release reaches a machine,
+# but refusing it outright would be wrong: most installs are fine, and the
+# model has no way to know the version to pin without looking it up first.
+#
+# `args.1` is the discriminator. It carries the first thing after the
+# subcommand, so a bare `npm install` — which installs the lockfile, the safe
+# case — has no `args.1` at all, and a path that resolves to nothing fails the
+# positive operator.
+#
+# Known ceiling: `npm install --save-dev jest` puts a flag in `args.1` and
+# passes. Widening it means enumerating every package-manager flag by hand,
+# which is a poor trade for a rule that only attaches a note.
+[[rules]]
+name = "unpinned-install"
+description = "An unpinned install takes whatever the registry serves today."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["npm", "pnpm", "yarn", "bun"] }
+"args.0" = { any_of = ["install", "add", "i"] }
+"args.1" = { matches = "^[^-]" }
+args = { none_glob = ["*@[0-9]*", "*@^[0-9]*", "*@~[0-9]*"] }
+
+[rules.action]
+kind = "context"
+message = """
+steer: this adds a dependency at whatever version the registry serves right \
+now. Pin it (`pkg@1.2.3`) so the lockfile and the next install agree, and \
+check first whether something already in the tree covers it."""
+
+[rules.test]
+fires = ["npm install left-pad", "pnpm add zod"]
+ignores = ["npm install", "npm install left-pad@1.3.0", "npm ci", "yarn add zod@^3.22.0"]

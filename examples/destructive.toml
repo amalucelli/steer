@@ -1,0 +1,274 @@
+# Destructive and irreversible operations.
+#
+# Nothing here is compiled into the binary, and installing steer does not turn
+# any of it on. Copy what you want into `~/.config/steer/config.toml` or a repo
+# `.steer.toml`, and leave the rest.
+#
+#   steer check --config examples/destructive.toml 'git reset --hard origin/main'
+#   steer validate --config examples/destructive.toml
+#
+# `force-with-lease` used to live here and is now a built-in, active with no
+# config at all.
+#
+# The last four assume a stack you may not run. They are here because the range
+# is the point: steer sees every command, not only the ones its built-ins know
+# about. Swap `*prod*` for whatever your environments are actually called.
+
+
+# The only rule in these files that reads `wrappers`, and the shortest one
+# here. A leading `sudo` is peeled off the segment during enrichment so that
+# `sudo apt install jq` matches an `apt` rule — which leaves `wrappers` as the
+# one place the escalation is still visible.
+#
+# The judgement is not that sudo is dangerous. It is that a machine-wide change
+# is a decision with a different owner, and an agent that reaches for it has
+# usually mistaken a permissions error for a missing package.
+#
+# Expect to soften this. A `none_of` on the head is how — letting through the
+# handful of commands your setup genuinely needs it for.
+[[rules]]
+name = "no-sudo"
+description = "A machine-wide change is a decision with a different owner."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+wrappers = { any_of = ["sudo", "doas"] }
+
+[rules.action]
+kind = "deny"
+message = """
+This changes the machine rather than the project, and that is the user's call \
+to make.
+
+Most of the time the escalation is not the fix: a project-local install \
+(`--user`, a virtualenv, `brew` without sudo) does the job, and a permission \
+error on a file inside the repo usually means the path is wrong rather than \
+that the write needs root.
+
+If root really is required, say what needs running and why."""
+
+[rules.test]
+fires = ["sudo apt install jq", "sudo -u postgres psql", "sudo rm -rf /opt/thing"]
+ignores = ["apt install jq", "brew install jq", "cargo build"]
+
+
+# Volumes are where a container keeps the thing you cannot rebuild. Everything
+# else docker holds — images, layers, stopped containers — is a download away.
+#
+# The blocks are ordered by how easy the mistake is. `down -v` is the dangerous
+# one, because `docker compose down` on its own is a normal thing to run and
+# the flag that destroys data is one character.
+#
+# Known ceiling, the kubectl one again: `docker compose -f x.yml down -v` puts
+# `-f` in `args.1` and passes.
+[[rules]]
+name = "docker-prune-guard"
+description = "Docker volumes hold the state that cannot be rebuilt."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["docker"] }
+"args.0" = { any_of = ["compose"] }
+"args.1" = { any_of = ["down"] }
+args = { any_of = ["-v", "--volumes"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["docker-compose"] }
+"args.0" = { any_of = ["down"] }
+args = { any_of = ["-v", "--volumes"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["docker"] }
+"args.0" = { any_of = ["volume"] }
+"args.1" = { any_of = ["rm", "prune"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["docker"] }
+"args.0" = { any_of = ["system"] }
+"args.1" = { any_of = ["prune"] }
+args = { any_of = ["--volumes"] }
+
+[rules.action]
+kind = "deny"
+message = """
+This deletes volumes, which is where the database lives. Images and containers \
+come back from a pull or a build; volume contents do not.
+
+`docker compose down` without `-v` stops everything and keeps the data. \
+`docker system prune` without `--volumes` reclaims disk without touching it. \
+If the data really should go, that is worth saying out loud first."""
+
+[rules.test]
+fires = ["docker compose down -v", "docker-compose down --volumes", "docker volume rm app_data", "docker system prune --volumes"]
+ignores = ["docker compose down", "docker system prune -a", "docker ps -a", "docker volume ls"]
+
+
+# These three discard work that exists in no other place. Almost everything
+# else git does is recoverable through the reflog; a hard reset over
+# uncommitted changes, a clean over untracked files, and a checkout of the
+# working tree are not.
+#
+# The rule matters most where several agents share one tree, since the work
+# being thrown away may not belong to whoever asked.
+#
+# The clean block matches on the flag run rather than exact flags, because `-f`
+# arrives as `-fd`, `-fdx`, and `-xdf` about as often as alone. `git clean -n`
+# is the dry run and carries neither `f` nor `x`, so it passes.
+#
+# Known ceiling: `git restore src/main.rs` names a path rather than `.` and
+# gets through. Catching it means matching `restore` with no `--staged`, which
+# also catches `git checkout -b feature` — the wrong trade.
+[[rules]]
+name = "no-history-loss"
+description = "Discarding uncommitted work is the one thing git cannot undo."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["reset"] }
+args = { any_of = ["--hard"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["clean"] }
+args = { matches = "^-[a-eg-wyzA-Z]*[fx]" }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["git"] }
+"args.0" = { any_of = ["checkout", "restore"] }
+args = { any_of = ["."] }
+
+[rules.action]
+kind = "deny"
+message = """
+This throws away changes that exist nowhere else — the reflog does not cover \
+uncommitted work.
+
+To get a clean tree without losing it, commit to a scratch branch \
+(`git switch -c wip && git commit -am wip`). To see what would go, \
+`git clean -n` and `git diff`. If the changes really are unwanted, say so and \
+the user will run it."""
+
+[rules.test]
+fires = ["git reset --hard origin/main", "git clean -fd", "git clean -xdf", "git checkout ."]
+ignores = ["git reset HEAD~1", "git clean -n", "git checkout -b feature", "git restore --staged src/main.rs"]
+
+
+# Only git's own leading options are peeled during enrichment, so `args.0` is
+# the subcommand for git and nothing else. `kubectl --context prod delete pod`
+# puts `--context` in `args.0`, which is why this block asks the whole `args`
+# array for a destructive verb and a production-looking operand rather than
+# pinning either to a position.
+#
+# The looseness is real and worth knowing: a manifest named `prod-api.yaml`
+# passed to a `kubectl delete -f` against staging still matches. Firing on a
+# false positive costs one retry; missing a real one costs a cluster.
+#
+# `*prod*` catches `prod`, `production`, and `prod-eu`, and nothing named
+# `live` or `main`. Adjust it to your contexts before taking this.
+[[rules]]
+name = "kubectl-prod-guard"
+description = "Destructive kubectl verbs stop at anything named production."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["kubectl", "helm"] }
+args = { any_of = ["delete", "drain", "cordon", "scale", "rollout", "uninstall"], glob = ["*prod*"] }
+
+[rules.action]
+kind = "deny"
+message = """
+This is a destructive verb against something named production.
+
+Run it against the staging context first and confirm the object list is what \
+you expect. If production really is the target, the user runs it — the blast \
+radius is theirs to accept."""
+
+[rules.test]
+fires = ["kubectl --context prod-eu delete deployment api", "helm uninstall api --namespace production"]
+ignores = ["kubectl --context staging delete pod api-0", "kubectl get pods --context prod-eu", "kubectl --context prod-eu logs api-0"]
+
+
+# `-auto-approve` removes the one step in the terraform workflow where a human
+# reads what is about to change. The plan is the review, and skipping it is the
+# whole risk in a single flag.
+#
+# Known ceiling: `terraform -chdir=infra apply -auto-approve` puts `-chdir` in
+# `args.0` and passes, for the same reason the kubectl rule above is loose.
+# Common in CI, rare from an agent, so the tighter match is worth keeping here.
+[[rules]]
+name = "terraform-no-auto-approve"
+description = "The plan is the review step; -auto-approve deletes it."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["terraform", "tofu"] }
+"args.0" = { any_of = ["apply", "destroy"] }
+args = { any_of = ["-auto-approve", "--auto-approve"] }
+
+[rules.action]
+kind = "deny"
+message = """
+`-auto-approve` skips the one point where the change is read before it \
+happens.
+
+Write the plan out and review it: `terraform plan -out tf.plan`, then hand \
+`terraform apply tf.plan` to the user. An apply of a saved plan needs no \
+approval flag, because the approval already happened."""
+
+[rules.test]
+fires = ["terraform apply -auto-approve", "tofu destroy --auto-approve"]
+ignores = ["terraform plan -out tf.plan", "terraform apply tf.plan", "terraform init"]
+
+
+# Two ways to lose a database: connect to the wrong one, or run the wrong
+# statement against the right one. The first block is the host, the second is
+# the statement.
+#
+# The second block asks one `args` array for two different things at once — an
+# element equal to one of the inline-statement flags, and an element matching a
+# destructive statement. Both operators sit on the same key and are ANDed,
+# which is how a flag and its value get tested together without knowing which
+# position either landed in. The flag list spans three clients, since each
+# spells it differently.
+#
+# Known ceiling: a statement in a file (`psql -f migrate.sql`) is invisible.
+# steer sees the command line and nothing it reads.
+[[rules]]
+name = "psql-prod-guard"
+description = "Database clients stop at production hosts and destructive statements."
+tool = "Bash"
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["psql", "mysql", "mongosh", "redis-cli"] }
+args = { glob = ["*prod*"] }
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["psql", "mysql", "mongosh"] }
+args = { any_of = ["-c", "--command", "-e", "--execute", "--eval"], matches = '(?i)\b(drop\s+(table|database|schema)|truncate|delete\s+from|update\s+\w+\s+set)\b' }
+
+[rules.action]
+kind = "deny"
+message = """
+This either points at a production database or runs a statement that cannot \
+be undone.
+
+Read before you write: `select count(*)` the rows the statement would touch, \
+against a replica or a local copy. A destructive statement against production \
+is the user's to run."""
+
+[rules.test]
+fires = ["psql -h db.prod.internal -c 'select 1'", "psql -c 'delete from users where id = 1'", "mysql -e 'truncate sessions'"]
+ignores = ["psql -h localhost -c 'select count(*) from users'", "psql -h db.staging.internal", "mongosh --eval 'db.users.countDocuments()'"]

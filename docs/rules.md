@@ -44,6 +44,10 @@ Any tool is matchable through its own input fields, so a rule on `Grep` matching
 
 `[rules.test]` is a section, so it goes last or it captures the keys after it.
 
+Examples are Bash command lines. A rule gated on another tool cannot declare any — doing so is
+reported as a problem rather than silently passing — so a rule on `Read` or `WebFetch` is compiled
+and checked for bad globs and unknown fields, but nothing proves it fires.
+
 ## The match document
 
 Every payload carries `tool_name` plus the tool's own input fields — `command` for Bash, `file_path`
@@ -157,6 +161,11 @@ Each source stacks on the one before:
 1. Built-ins, compiled into the binary.
 2. `~/.config/steer/config.toml`, honoring `$XDG_CONFIG_HOME`.
 3. `.steer.toml`, found by walking up from the session's working directory.
+
+`steer check --config <path>` and `steer validate --config <path>` set that aside and evaluate the
+named file alone, which is how a rule gets read before it is adopted. `builtins = false` is inert
+there — nothing loaded them — and a `disable` naming a rule the file does not define is the same
+error it always was, since the disable is answered by what loaded. `steer hook` has no such flag.
 
 A later source replaces an earlier rule of the same name, and `disable = ["fff-over-grep"]` switches
 one off wherever it came from. What a repo file cannot do is quietly soften a rule it does not name:

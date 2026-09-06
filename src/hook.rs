@@ -106,7 +106,7 @@ fn decide(event: Event, flag: Option<Agent>) -> Result<Option<String>> {
     let tool_name = payload.tool_name.clone().unwrap_or_default();
     let tool_input = payload.tool_input.clone().unwrap_or_else(|| json!({}));
 
-    let mut ruleset = config::load(&config_cwd)?;
+    let mut ruleset = config::load(&config_cwd, config::Origin::Stack)?;
     // Denying or rewriting a call that already ran means nothing, so after the
     // fact only context injection is left.
     if event == Event::PostToolUse {

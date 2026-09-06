@@ -52,6 +52,36 @@ in it holds against one binding. Every matching rule is evaluated and the strong
 [docs/rules.md](docs/rules.md) has the rest: the match document, the condition operators, what each
 action does, and the harness gates.
 
+## Examples
+
+[examples/](examples/) is a menu of thirty-two rules to copy from, none of them active until you
+do:
+
+- [secrets.toml](examples/secrets.toml) — reading a `.env` or a private key into the transcript,
+  dumping the environment, a token in argv or in a URL, a command whose whole job is printing a
+  credential, committing a key.
+- [network.toml](examples/network.toml) — `curl -k` and the environment variables that mean the
+  same thing, a registry override, a fetch outside the host allowlist, an install with nothing
+  pinned.
+- [destructive.toml](examples/destructive.toml) — discarding uncommitted work, `sudo`, docker
+  volumes, kubectl and psql pointed at production, `terraform apply -auto-approve`.
+- [outward.toml](examples/outward.toml) — publishing a package, merging a pull request, cutting a
+  release, commenting under the user's name, moving a published tag, deploying.
+- [session.toml](examples/session.toml) — an `export` or `cd` that ends with the call, a sleep that
+  spends the time budget, a detached process nothing will stop, a setup wizard with no stdin.
+- [workflow.toml](examples/workflow.toml) — staying inside the working tree, who gets to stage a
+  commit, `--no-verify`, global git config, dev servers, hand-edited lockfiles, whole-suite test
+  runs.
+
+Each rule carries the reasoning that produced it: what it lets through on purpose, and where it
+stops working. `--config` runs a file on its own, in place of the built-ins and your config, which
+is how you try one before taking it:
+
+```sh
+steer check --config examples/destructive.toml 'git reset --hard origin/main'
+steer validate --config examples/destructive.toml
+```
+
 ## Install
 
 ```sh
@@ -82,7 +112,7 @@ what differs there.
 steer hook --event PreToolUse|PostToolUse [--agent claude|codex]
 
 # dry-run a command through the rules
-steer check '<command>'
+steer check [--config <path>] '<command>'
 
 # what the rules would now answer differently
 steer replay [--since <age>]
@@ -91,16 +121,21 @@ steer replay [--since <age>]
 steer suggest [--since <age>] [--all] [--apply|--draft <name>]
 
 # the effective ruleset and its problems
-steer validate
+steer validate [--config <path>]
 
 # write a starter global config
 steer init
 ```
 
 Everything from `check`'s first positional word on is the command line, so `steer check -la` reaches
-the rules with its flags intact. It exits 1 when the command would be denied, and prints a `nearest`
-block when nothing matched: the rules that came closest, each condition ticked or crossed with the
-actual value.
+the rules with its flags intact — which is also why `--config` has to come before the command. It
+exits 1 when the command would be denied, and prints a `nearest` block when nothing matched: the
+rules that came closest, each condition ticked or crossed with the actual value.
+
+`--config <path>` replaces the whole stack with that one file: no built-ins, no
+`~/.config/steer/config.toml`, no repo `.steer.toml`. It is how a rule gets read before it is
+adopted, and `validate` runs the file's `[rules.test]` examples the same way it runs everyone
+else's.
 
 ## Config
 
@@ -127,6 +162,14 @@ line, and exit 1.
 | `edit-over-python` | deny | all | `python3 - <<'PY'`, a whole program written inline to do file surgery |
 | `edit-over-inplace` | deny | all | `sed -i`, `perl -pi`, `awk -i inplace` — the same file surgery written as a flag |
 | `trash-over-rm` | rewrite | all | `rm` becomes `trash`, recursive and force flags dropped |
+| `no-pipe-to-shell` | deny | all | `curl … \| sh`, a script executed before anything reads it |
+| `force-with-lease` | rewrite | all | `git push --force` becomes `--force-with-lease` |
+| `no-interactive-commands` | deny | all | `git rebase -i`, `git add -p`, `vim`, `less`, a bare `ssh` — programs that wait for a terminal that isn't there |
+
+The first five are about tool routing: a shell command standing in for something the harness does
+better. The last three are not. Two of them stop an operation that cannot be undone, and the third
+is a fact about the environment rather than an opinion — a hook-driven session has no terminal, so
+an interactive program hangs until it is killed.
 
 Two are Claude-only because of where their messages point: Codex has no read tool and no fff, and a
 deny naming a tool the model cannot call is worse than no rule.

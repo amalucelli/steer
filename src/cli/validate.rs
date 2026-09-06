@@ -11,9 +11,12 @@ use crate::{config, rules};
 use anyhow::Result;
 use std::path::Path;
 
-pub fn validate() -> Result<i32> {
+pub fn validate(only: Option<&Path>) -> Result<i32> {
     let cwd = std::env::current_dir()?;
-    let report = config::inspect(&cwd)?;
+    let report = config::inspect(
+        &cwd,
+        only.map_or(config::Origin::Stack, config::Origin::Only),
+    )?;
     let ink = Ink::new();
     let active = print_layers(&report, &cwd, &ink);
 

@@ -24,6 +24,7 @@ use anyhow::{bail, Context, Result};
 use clap::builder::styling::{AnsiColor, Styles};
 use clap::{ArgAction, Parser, Subcommand};
 use ink::Ink;
+use std::path::PathBuf;
 
 // `task install` sets STEER_DIRTY so a locally built binary is distinguishable
 // from a released one that happens to carry the same crate version.
@@ -77,6 +78,10 @@ pub enum Sub {
     },
     /// Dry-run a Bash command through the rules
     Check {
+        /// Take this file as the whole ruleset, in place of the built-ins, the
+        /// global config, and any `.steer.toml`. Goes before the command
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
         /// The command line to evaluate, as one argument or as words
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -109,7 +114,12 @@ pub enum Sub {
         all: bool,
     },
     /// Print the effective ruleset, with any problems in it
-    Validate,
+    Validate {
+        /// Take this file as the whole ruleset, in place of the built-ins, the
+        /// global config, and any `.steer.toml`
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+    },
     /// Write a starter global config
     Init,
 }
