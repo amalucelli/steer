@@ -21,6 +21,37 @@ message
   steer: `rm` becomes `trash` so the delete stays recoverable.
 ```
 
+## Write a rule
+
+```toml
+[[rules]]
+name = "no-curl"
+description = "Network fetches go through the WebFetch tool."
+tool = "Bash"  # omit and the rule sees every tool
+
+[[rules.match]]
+any = "parsed.segments"
+head = { any_of = ["curl", "wget"] }
+pipeline_start = { is = true }
+args = { none_glob = ["http://localhost*", "http://127.0.0.1*"] }
+
+[rules.action]
+kind = "deny"
+message = "Use WebFetch — it renders the page and stays in the transcript."
+
+[rules.test]
+fires = ["curl https://api.example.com"]
+ignores = ["curl http://localhost:8080/health", "gh pr list | curl -X POST"]
+```
+
+A rule fires when any of its `[[rules.match]]` blocks holds, and a block holds when every condition
+in it holds against one binding. Every matching rule is evaluated and the strongest action wins —
+**deny > rewrite > context** — so file order never changes the outcome. `steer validate` runs the
+`[rules.test]` examples and fails when one stops firing.
+
+[docs/rules.md](docs/rules.md) has the rest: the match document, the condition operators, what each
+action does, and the harness gates.
+
 ## Install
 
 ```sh
@@ -86,37 +117,6 @@ them all is complete only until the next built-in ships. `steer validate` prints
 every source, the rules it declares, what each one tests, and what became of it once the sources
 collapsed — along with unknown fields, bad globs, duplicate names, and failing tests, with file and
 line, and exit 1.
-
-## Write a rule
-
-```toml
-[[rules]]
-name = "no-curl"
-description = "Network fetches go through the WebFetch tool."
-tool = "Bash"  # omit and the rule sees every tool
-
-[[rules.match]]
-any = "parsed.segments"
-head = { any_of = ["curl", "wget"] }
-pipeline_start = { is = true }
-args = { none_glob = ["http://localhost*", "http://127.0.0.1*"] }
-
-[rules.action]
-kind = "deny"
-message = "Use WebFetch — it renders the page and stays in the transcript."
-
-[rules.test]
-fires = ["curl https://api.example.com"]
-ignores = ["curl http://localhost:8080/health", "gh pr list | curl -X POST"]
-```
-
-A rule fires when any of its `[[rules.match]]` blocks holds, and a block holds when every condition
-in it holds against one binding. Every matching rule is evaluated and the strongest action wins —
-**deny > rewrite > context** — so file order never changes the outcome. `steer validate` runs the
-`[rules.test]` examples and fails when one stops firing.
-
-[docs/rules.md](docs/rules.md) has the rest: the match document, the condition operators, what each
-action does, and the harness gates.
 
 ## Built-in rules
 
