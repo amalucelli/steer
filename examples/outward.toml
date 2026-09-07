@@ -28,7 +28,7 @@
 [[rules]]
 name = "no-publish"
 description = "A published version is permanent, including the ones you yank."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -66,7 +66,7 @@ ignores = ["npm publish --dry-run", "cargo publish --dry-run", "npm pack", "carg
 [[rules]]
 name = "no-release-or-merge"
 description = "Merges, releases, and repository deletion are the user's to run."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -113,7 +113,7 @@ ignores = ["gh pr create --title fix --body x", "gh pr list", "gh pr checks 42",
 [[rules]]
 name = "no-post-as-user"
 description = "Comments and messages carry the user's name and arrive as notifications."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -153,7 +153,7 @@ ignores = ["gh pr view 42", "gh issue list", "curl -X POST https://api.internal.
 [[rules]]
 name = "no-tag-rewrite"
 description = "A published tag is a promise; moving one breaks every clone silently."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -196,7 +196,7 @@ ignores = ["git tag v1.0.0", "git tag -l", "git push origin main", "git tag -a v
 [[rules]]
 name = "no-deploy"
 description = "A deploy is serving traffic before the command returns."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"

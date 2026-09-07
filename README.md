@@ -11,6 +11,7 @@ last layer that still gets to decide.
 ```js
 $ steer check 'cd build && rm -rf dist'
 command   cd build && rm -rf dist
+cwd       /home/me/src/app
 segments
   head=cd args=["build"] pipeline_start=true in_workspace=true depth=0
   head=rm args=["-rf", "dist"] pipeline_start=true in_workspace=true depth=0
@@ -27,7 +28,8 @@ message
 [[rules]]
 name = "no-curl"
 description = "Network fetches go through the WebFetch tool."
-tool = "Bash"  # omit and the rule sees every tool
+tool = "shell"  # omit and the rule sees every tool
+agents = ["claude"]  # the message names a Claude Code tool
 
 [[rules.match]]
 any = "parsed.segments"
@@ -88,28 +90,49 @@ steer validate --config examples/destructive.toml
 brew install --cask amalucelli/tap/steer
 ```
 
-Or from source: `cargo install --path . --root ~/.local`. Then register it in
-`~/.claude/settings.json`:
+Or from source: `cargo install --path . --root ~/.local`. Then register it. Under Claude Code that
+is `~/.claude/settings.json`:
 
 ```json
 {
   "hooks": {
     "PreToolUse": [
-      { "hooks": [{ "type": "command", "command": "steer hook --event PreToolUse" }] }
+      { "hooks": [{ "type": "command", "command": "steer hook --event PreToolUse --agent claude" }] }
     ]
   }
 }
 ```
 
 No config file is needed — the built-in rules are compiled into the binary and active on install.
-Codex takes the same block from `~/.codex/hooks.json`; see [docs/rules.md](docs/rules.md#codex) for
-what differs there.
+
+Twelve more harnesses take that same command in their own pre-tool hook file, with their own name:
+`steer hook --event PreToolUse --agent codex`. Every registration names its harness, and one that
+names none is allowed through with a `systemMessage` asking for it — harnesses copy each other's
+payload shapes, so steer never guesses which one it is talking to.
+
+| | `--agent` |
+| --- | --- |
+| **Command hook** | `claude`, `codex`, `qwen`, `continue`, `junie`, `gemini`, `cursor`, `copilot`, `crush`, `cline`, `goose`, `windsurf`, `antigravity` |
+| **Plugin** | `opencode`, `pi`, `amp` |
+
+[docs/rules.md](docs/rules.md#harnesses) has the file each one is registered in, whether it accepts
+an edited tool input, and whether it will take a note before the call runs.
+
+OpenCode, pi and Amp load a plugin into their own process instead of spawning one, so steer writes
+theirs:
+
+```sh
+steer init --agent opencode   # or pi, or amp
+```
+
+It refuses to overwrite a file that is already there. `--force` is how an upgraded steer replaces
+the plugin an older one wrote, which otherwise keeps talking to a binary it no longer matches.
 
 ## Commands
 
 ```sh
 # decide on a payload from stdin
-steer hook --event PreToolUse|PostToolUse [--agent claude|codex]
+steer hook --event PreToolUse|PostToolUse [--agent <harness>]
 
 # dry-run a command through the rules
 steer check [--config <path>] '<command>'
@@ -123,8 +146,8 @@ steer suggest [--since <age>] [--all] [--apply|--draft <name>]
 # the effective ruleset and its problems
 steer validate [--config <path>]
 
-# write a starter global config
-steer init
+# write a starter global config, or a harness's plugin file
+steer init [--agent <harness>] [--force]
 ```
 
 Everything from `check`'s first positional word on is the command line, so `steer check -la` reaches
@@ -158,7 +181,7 @@ line, and exit 1.
 | Name | Action | Agents | What it catches |
 | --- | --- | --- | --- |
 | `fff-over-grep` | deny | claude | `grep`, `rg`, `find`, `git grep` and friends leading a pipeline over an indexed path |
-| `read-over-shell-pager` | deny | claude | `sed -n`, `cat -n`, `cat file \| head`, `awk 'NR>=x'` — the family of ways to ask for a line range from a file |
+| `read-over-shell-pager` | deny | all with a read tool | `sed -n`, `cat -n`, `cat file \| head`, `awk 'NR>=x'` — the family of ways to ask for a line range from a file |
 | `edit-over-python` | deny | all | `python3 - <<'PY'`, a whole program written inline to do file surgery |
 | `edit-over-inplace` | deny | all | `sed -i`, `perl -pi`, `awk -i inplace` — the same file surgery written as a flag |
 | `trash-over-rm` | rewrite | all | `rm` becomes `trash`, recursive and force flags dropped |
@@ -171,12 +194,19 @@ better. The last three are not. Two of them stop an operation that cannot be und
 is a fact about the environment rather than an opinion — a hook-driven session has no terminal, so
 an interactive program hangs until it is killed.
 
-Two are Claude-only because of where their messages point: Codex has no read tool and no fff, and a
-deny naming a tool the model cannot call is worse than no rule.
+`fff-over-grep` is Claude-only because of where its message points: fff is an MCP server the user
+configured rather than a tool any harness ships, so there is nothing to name elsewhere.
+`read-over-shell-pager` names a read tool instead of a vendor's, so it applies wherever the harness
+has one — everywhere but Codex and Goose, which have none, and a deny naming a tool the model cannot
+call is worse than no rule.
+
+The two rewrites arrive as a deny carrying the corrected command on the five harnesses that accept
+no edited tool input — Codex, Cline, Goose, Windsurf and Antigravity — which reads as guidance
+rather than as a silent correction.
 
 ## Log
 
-Every deny, rewrite, and context injection — plus every allowed **Bash** call — appends a JSON line
+Every deny, rewrite, and context injection — plus every allowed **shell** call — appends a JSON line
 to `~/.local/state/steer/steer.jsonl`. `steer replay` runs the current rules over that log and prints
 only what they would now answer differently, which is how a rule gets tested before it ships.
 `steer suggest` reports what the log says is missing: a deny and the command that got through right

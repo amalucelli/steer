@@ -19,7 +19,7 @@ pub use replay::replay_cmd;
 pub use suggest::suggest_cmd;
 pub use validate::validate;
 
-use crate::{config, Agent, Event};
+use crate::{config, shim, Agent, Event};
 use anyhow::{bail, Context, Result};
 use clap::builder::styling::{AnsiColor, Styles};
 use clap::{ArgAction, Parser, Subcommand};
@@ -43,6 +43,7 @@ const AFTER_HELP: &str = "Examples:
   steer check 'grep -rn foo src'
   steer hook --event PreToolUse < payload.json
   steer validate
+  steer init --agent opencode
 
 hook detects the harness from the payload when --agent is omitted.
 check evaluates every rule whatever its harness gate, and takes its command verbatim.";
@@ -120,8 +121,18 @@ pub enum Sub {
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
     },
-    /// Write a starter global config
-    Init,
+    /// Write a starter global config, or a harness's plugin file
+    Init {
+        /// Write this harness's plugin into the project instead of the global
+        /// config. Only for the harnesses that load a module rather than
+        /// spawning one
+        #[arg(long)]
+        agent: Option<Agent>,
+        /// Replace the file if it is already there, which is how an upgraded
+        /// steer gets its shim rewritten
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// How far back to read, as a window rather than a count of days.
@@ -156,9 +167,24 @@ fn history(since: Option<u64>) -> Result<Vec<crate::replay::Entry>> {
     crate::replay::entries(&path, since)
 }
 
-pub fn init() -> Result<i32> {
-    let path = config::global_path().context("neither XDG_CONFIG_HOME nor HOME is set")?;
-    config::init(&path)?;
+pub fn init(agent: Option<Agent>, force: bool) -> Result<i32> {
+    let (path, contents) = match agent {
+        None => (
+            config::global_path().context("neither XDG_CONFIG_HOME nor HOME is set")?,
+            config::STARTER,
+        ),
+        Some(agent) => {
+            let shim = shim::of(agent).with_context(|| {
+                format!(
+                    "{} is registered as a command and needs no plugin; only {} do",
+                    agent.as_str(),
+                    shim::names()
+                )
+            })?;
+            (std::env::current_dir()?.join(shim.path), shim.contents)
+        }
+    };
+    config::init(&path, contents, force)?;
     let ink = Ink::new();
     println!("wrote {}", ink.bold(&path.display().to_string()));
     Ok(0)

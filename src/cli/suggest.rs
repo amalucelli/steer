@@ -413,7 +413,7 @@ fn miss(
     let input = json!({ "command": command });
     let Some(trace) = rules::trace_at(
         std::slice::from_ref(rule),
-        "Bash",
+        "shell",
         &input,
         cwd,
         Some(element),

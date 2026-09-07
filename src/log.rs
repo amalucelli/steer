@@ -1,4 +1,4 @@
-// Append-only JSON-lines record of everything steer acted on, plus every Bash
+// Append-only JSON-lines record of everything steer acted on, plus every shell
 // call it allowed, so a surprising deny can be traced back to the rule that
 // produced it without re-running the session.
 //
@@ -10,7 +10,7 @@ use crate::rules::Decision;
 use crate::{Agent, Event};
 use serde_json::{json, Value};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn path() -> Option<PathBuf> {
@@ -27,6 +27,7 @@ pub fn record(
     event: Event,
     agent: Agent,
     payload: &Payload,
+    cwd: Option<&Path>,
     tool_name: &str,
     tool_input: &Value,
     decision: &Decision,
@@ -45,7 +46,7 @@ pub fn record(
         // The harness; `agent_type` is the subagent profile, a different axis.
         "harness": agent.as_str(),
         "session_id": payload.session_id,
-        "cwd": payload.cwd,
+        "cwd": cwd.map(|cwd| cwd.display().to_string()),
         "updated_command": decision.updated_command,
     });
 

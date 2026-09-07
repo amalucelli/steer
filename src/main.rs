@@ -1,4 +1,4 @@
-// A hook for Claude Code and Codex that steers tool calls toward the right tool.
+// A hook that steers tool calls toward the right tool.
 //
 // Auto mode injects a system-level directive telling the model to search with
 // shell `grep` and read with `sed -n`, outranking anything in CLAUDE.md. This
@@ -9,16 +9,20 @@
 // into pipeline segments with their wrappers peeled, `rules` holds the
 // predicate language and the engine that runs it, `config` stacks built-in,
 // global, and repo-overlay sources, `replay` answers the questions only a
-// history can, `hook` speaks the hook protocol, `log` records what was acted
-// on, and `cli` is the terminal surface over all of it.
+// history can, `harness` holds one descriptor per harness steer speaks to,
+// `hook` runs the sequence between a payload and a response, `shim` holds the
+// plugin files the harnesses that cannot spawn a process need, `log` records
+// what was acted on, and `cli` is the terminal surface over all of it.
 
 mod cli;
 mod config;
+mod harness;
 mod hook;
 mod log;
 mod replay;
 mod rules;
 mod shell;
+mod shim;
 
 use clap::Parser;
 use cli::{Cli, Sub};
@@ -41,15 +45,29 @@ impl Event {
     }
 }
 
-/// The harness steer is speaking to. Codex copies Claude Code's hook protocol
-/// closely enough to share the rule engine, but not its tools or its answer to
-/// a rewrite.
+/// The harness steer is speaking to. Most copy Claude Code's hook protocol
+/// closely enough to share the rule engine, and none of them agree on its tools
+/// or on what it may answer with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[value(rename_all = "lowercase")]
 pub enum Agent {
     Claude,
     Codex,
+    Qwen,
+    Continue,
+    Junie,
+    Gemini,
+    Cursor,
+    Copilot,
+    Crush,
+    Cline,
+    Goose,
+    Windsurf,
+    Antigravity,
+    Opencode,
+    Pi,
+    Amp,
 }
 
 impl Agent {
@@ -57,6 +75,20 @@ impl Agent {
         match self {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
+            Agent::Qwen => "qwen",
+            Agent::Continue => "continue",
+            Agent::Junie => "junie",
+            Agent::Gemini => "gemini",
+            Agent::Cursor => "cursor",
+            Agent::Copilot => "copilot",
+            Agent::Crush => "crush",
+            Agent::Cline => "cline",
+            Agent::Goose => "goose",
+            Agent::Windsurf => "windsurf",
+            Agent::Antigravity => "antigravity",
+            Agent::Opencode => "opencode",
+            Agent::Pi => "pi",
+            Agent::Amp => "amp",
         }
     }
 }
@@ -93,7 +125,7 @@ fn main() {
             all,
         } => cli::suggest_cmd(since, apply, draft, all),
         Sub::Validate { config } => cli::validate(config.as_deref()),
-        Sub::Init => cli::init(),
+        Sub::Init { agent, force } => cli::init(agent, force),
     };
 
     let code = match result {

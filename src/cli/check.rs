@@ -60,8 +60,8 @@ pub fn check(rest: &[String], only: Option<&Path>) -> Result<i32> {
     }
 
     // No harness, so a per-harness message reports every copy it carries.
-    let decision = rules::evaluate(&ruleset, "Bash", &tool_input, Some(&cwd), None);
-    let traces = rules::trace(&ruleset, "Bash", &tool_input, Some(&cwd));
+    let decision = rules::evaluate(&ruleset, "shell", &tool_input, Some(&cwd), None);
+    let traces = rules::trace(&ruleset, "shell", &tool_input, Some(&cwd));
     if decision.fired.is_empty() {
         row(&ink, "matched", &ink.dim("-"));
     }

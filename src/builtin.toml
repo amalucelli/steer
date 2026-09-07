@@ -23,7 +23,7 @@
 [[rules]]
 name = "fff-over-grep"
 description = "Shell searches over indexed paths belong to the fff MCP tools."
-tool = "Bash"
+tool = "shell"
 agents = ["claude"]
 
 [[rules.match]]
@@ -97,11 +97,15 @@ ignores = ["gh pr list | grep foo", "find . -name '*.log' -delete", "rg -n lib n
 # taught the model to park a diff outside the tree and page it there. The cost
 # is that `cat a b > merged`, a real concatenation, has to be written some other
 # way.
+#
+# `requires` rather than a list of harnesses: the rule is for anywhere with a
+# read tool to point at, which is everywhere except Codex and Goose. Naming the
+# other fourteen would make the next harness a rule edit.
 [[rules]]
 name = "read-over-shell-pager"
-description = "Shell file reads and line-range pagers belong to the Read tool."
-tool = "Bash"
-agents = ["claude"]
+description = "Shell file reads and line-range pagers belong to a read tool."
+tool = "shell"
+requires = ["read", "search"]
 
 [[rules.match]]
 any = "parsed.segments"
@@ -123,7 +127,25 @@ args = { matches = "NR" }
 
 [rules.action]
 kind = "deny"
-message = """
+
+# Claude Code keeps a full copy for one reason the tokens cannot carry: the
+# search it should reach for is the fff MCP server the user configured, which is
+# no harness's own tool and so has no token to render.
+[rules.action.message]
+default = """
+Use the {read} tool to read a file rather than paging one through a shell \
+command.
+
+If the shape is `cat file | grep foo`, the search belongs to {search} rather \
+than a read piped into a filter.
+
+To feed a file into something that is not a pager — `jq`, a script, a \
+formatter — redirect it instead of catting it: `jq . < data.json`, not \
+`cat data.json | jq .`. The redirect is not a read, so it passes.
+
+Escapes: any of these after a pipe is a filter on output that already exists \
+and is fine, as is `tail -f`."""
+claude = """
 Use the Read tool to read a file. It takes `offset` and `limit` for a window \
 and returns numbered lines, so there is no need to page one with a shell \
 command.
@@ -159,7 +181,7 @@ ignores = ["jq . < data.json", "tail -f server.log", "go test ./... | head -20",
 [[rules]]
 name = "edit-over-python"
 description = "Inline Python programs fed to stdin belong to a real edit tool."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -173,15 +195,17 @@ head = { any_of = ["python", "python3"] }
 args = { none_glob = ["*"] }
 pipeline_start = { is = true }
 
-# The offense is identical under either harness, an unreviewable edit arriving as
-# a program, so only the tool name differs.
+# The offense is identical under every harness, an unreviewable edit arriving as
+# a program, so the default carries it. Codex still keeps a full copy: its
+# guidance leans on Codex's own instructions, and `apply_patch` both edits and
+# creates, so the two-tool sentence has nothing to substitute into.
 [rules.action]
 kind = "deny"
 
 [rules.action.message]
-claude = """
-Use the Edit tool to change a file and the Write tool to create one. Both show \
-the change in the transcript, and Edit fails loudly when the text it was told \
+default = """
+Use the {edit} tool to change a file and the {write} tool to create one. Both show \
+the change in the transcript, and {edit} fails loudly when the text it was told \
 to replace is not there, rather than writing something unintended.
 
 Two escapes. `python3 -c` for a short computation is fine, and so is a real \
@@ -220,7 +244,7 @@ ignores = ["python3 -c 'print(1)'", "python3 scripts/build.py", "cat data.json |
 [[rules]]
 name = "edit-over-inplace"
 description = "In-place stream edits belong to a real edit tool."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -231,9 +255,9 @@ args = { matches = "^(-[0-9nplawsEr]*i|--in-place)" }
 kind = "deny"
 
 [rules.action.message]
-claude = """
-Use the Edit tool to change a file and the Write tool to create one. Both show \
-the change in the transcript, and Edit fails loudly when the text it was told \
+default = """
+Use the {edit} tool to change a file and the {write} tool to create one. Both show \
+the change in the transcript, and {edit} fails loudly when the text it was told \
 to replace is not there, rather than writing something unintended.
 
 A stream editor writing to stdout or into a pipe is transforming a stream \
@@ -258,7 +282,7 @@ ignores = ["perl -MList::Util -e 1", "perl -mstrict -e 1", "perl -e'print 1'", "
 [[rules]]
 name = "trash-over-rm"
 description = "Deletes go to the trash so they stay recoverable."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -290,7 +314,7 @@ rewrites = { "rm -rf dist" = "trash dist", "cd build && rm -f out.o" = "cd build
 [[rules]]
 name = "no-pipe-to-shell"
 description = "A script fetched and executed in one breath is never read."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -334,7 +358,7 @@ ignores = ["bash scripts/build.sh", "bash -c 'cargo test'", "find . -name x | xa
 [[rules]]
 name = "force-with-lease"
 description = "A force push checks the remote it is overwriting."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -371,7 +395,7 @@ rewrites = { "git push --force origin main" = "git push origin main --force-with
 [[rules]]
 name = "no-interactive-commands"
 description = "Nothing is attached to this terminal; an interactive program hangs until it is killed."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"

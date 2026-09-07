@@ -34,7 +34,7 @@
 [[rules]]
 name = "shell-state-does-not-persist"
 description = "Each tool call is a new shell; state set in one is gone in the next."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 all = "parsed.segments"
@@ -74,7 +74,7 @@ ignores = ["source .venv/bin/activate && pytest", "cd services/api && cargo test
 [[rules]]
 name = "no-blocking-sleep"
 description = "A sleep spends the call's time budget waiting for something it cannot observe."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -113,7 +113,7 @@ ignores = ["sleep 2", "sleep 0.5", "sleep 5"]
 [[rules]]
 name = "no-detached-process"
 description = "A detached process outlives the call and nothing is left to stop it."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -157,7 +157,7 @@ ignores = ["npm start", "docker run --rm postgres:16 psql --version", "docker ps
 [[rules]]
 name = "no-setup-wizard"
 description = "A wizard reads from stdin, and there is no stdin here."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"

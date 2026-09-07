@@ -6,6 +6,7 @@
 // the same name; strongest-wins in the engine means an overlay still cannot
 // weaken a deny, only replace the rule outright.
 
+use crate::harness;
 use crate::rules::{Action, Message, Predicate, Rule, RuleSpec};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -101,6 +102,9 @@ pub fn to_toml(spec: &RuleSpec) -> String {
         let names: Vec<String> = agents.iter().map(|a| a.as_str().to_string()).collect();
         out.push_str(&format!("agents = {}\n", array(&names)));
     }
+    if !spec.requires.is_empty() {
+        out.push_str(&format!("requires = {}\n", array(&spec.requires)));
+    }
     for block in &spec.blocks {
         out.push_str("\n[[rules.match]]\n");
         if let Some(path) = &block.any {
@@ -174,8 +178,8 @@ fn message_toml(message: &Message, omit_empty: bool) -> String {
         Message::Every(text) => format!("message = {}\n", string(text)),
         Message::PerAgent(per) => {
             let mut out = String::from("\n[rules.action.message]\n");
-            for (agent, text) in per {
-                out.push_str(&format!("{} = {}\n", agent.as_str(), string(text)));
+            for (audience, text) in per {
+                out.push_str(&format!("{} = {}\n", audience.as_str(), string(text)));
             }
             out
         }
@@ -432,7 +436,63 @@ pub fn inspect(cwd: &Path, origin: Origin) -> Result<Report> {
     struct LocatedRule {
         name: toml::Spanned<String>,
         #[serde(default)]
+        tool: Option<toml::Spanned<String>>,
+        #[serde(rename = "match", default)]
+        blocks: Vec<LocatedBlock>,
+        #[serde(default)]
         test: LocatedTest,
+    }
+    /// A block down to the two things a span is wanted for: the tool names it
+    /// gates on, and the fields it matches on.
+    ///
+    /// Read by hand because a span does not survive `#[serde(flatten)]` — the
+    /// flattened half is replayed from a buffered copy, and the offsets belong
+    /// to the text that copy was made from. A condition is an arbitrary key, so
+    /// there is no field to declare instead.
+    struct LocatedBlock {
+        tool_name: Option<LocatedPredicate>,
+        conditions: Vec<(toml::Spanned<String>, Predicate)>,
+    }
+
+    impl<'de> Deserialize<'de> for LocatedBlock {
+        fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<LocatedBlock, D::Error> {
+            struct Block;
+            impl<'de> serde::de::Visitor<'de> for Block {
+                type Value = LocatedBlock;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a match block")
+                }
+
+                fn visit_map<M: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: M,
+                ) -> Result<LocatedBlock, M::Error> {
+                    let mut block = LocatedBlock {
+                        tool_name: None,
+                        conditions: Vec::new(),
+                    };
+                    while let Some(key) = map.next_key::<toml::Spanned<String>>()? {
+                        match key.get_ref().as_str() {
+                            "tool_name" => block.tool_name = Some(map.next_value()?),
+                            // The binding is a path into the document rather
+                            // than a condition on a field.
+                            "any" | "all" => {
+                                map.next_value::<serde::de::IgnoredAny>()?;
+                            }
+                            _ => block.conditions.push((key, map.next_value()?)),
+                        }
+                    }
+                    Ok(block)
+                }
+            }
+            de.deserialize_map(Block)
+        }
+    }
+    #[derive(Deserialize)]
+    struct LocatedPredicate {
+        #[serde(default)]
+        any_of: Vec<toml::Spanned<String>>,
     }
     #[derive(Default, Deserialize)]
     struct LocatedTest {
@@ -510,6 +570,49 @@ pub fn inspect(cwd: &Path, origin: Origin) -> Result<Report> {
             }
             seen.push(name.clone());
 
+            // A name ingest would have renamed is a rule that reads as live and
+            // matches nothing, which no example catches unless the rule happens
+            // to declare one. Two spellings of the same mistake: the tool a
+            // rule gates on, and the field a condition addresses.
+            let gates = rule
+                .tool
+                .iter()
+                .map(|gate| (gate, format!("tool = {:?}", gate.get_ref())))
+                .chain(
+                    rule.blocks
+                        .iter()
+                        .filter_map(|block| block.tool_name.as_ref())
+                        .flat_map(|predicate| &predicate.any_of)
+                        .map(|gate| (gate, format!("{:?} in tool_name", gate.get_ref()))),
+                );
+            for (gate, written) in gates {
+                let Some(canonical) = harness::rewritten(gate.get_ref()) else {
+                    continue;
+                };
+                problems.push(Problem {
+                    location: at(&source, gate.span().start),
+                    detail: format!(
+                        "`{written}` can never match; ingest renames it to `{canonical}`"
+                    ),
+                });
+            }
+
+            let fields = rule
+                .blocks
+                .iter()
+                .flat_map(|block| &block.conditions)
+                .filter(|(_, predicate)| predicate.asserts());
+            for (field, _) in fields {
+                let name = field.get_ref();
+                let Some(canonical) = harness::renamed_field(name) else {
+                    continue;
+                };
+                problems.push(Problem {
+                    location: at(&source, field.span().start),
+                    detail: format!("`{name}` can never match; ingest renames it to `{canonical}`"),
+                });
+            }
+
             let declared = rule
                 .test
                 .fires
@@ -577,10 +680,10 @@ pub fn inspect(cwd: &Path, origin: Origin) -> Result<Report> {
             continue;
         }
         for example in examples.get(&name).into_iter().flatten() {
-            if tool.as_deref().is_some_and(|tool| tool != "Bash") {
+            if tool.as_deref().is_some_and(|tool| tool != "shell") {
                 problems.push(Problem {
                     location: example.location.clone(),
-                    detail: format!("examples are Bash command lines, and rule `{name}` is gated on another tool"),
+                    detail: format!("examples are shell command lines, and rule `{name}` is gated on another tool"),
                 });
                 continue;
             }
@@ -631,16 +734,22 @@ fn at(source: &Source, offset: usize) -> String {
     format!("{}:{line}:{column}", source.label)
 }
 
-pub fn init(path: &Path) -> Result<()> {
-    if path.exists() {
-        bail!("{} already exists", path.display());
+/// Every file this writes is one someone may have edited, and there is no copy
+/// of their version anywhere else. `force` is the upgrade path, where a
+/// generated shim has to be replaced by the version of steer it now talks to.
+pub fn init(path: &Path, contents: &str, force: bool) -> Result<()> {
+    if path.exists() && !force {
+        bail!(
+            "{} already exists; pass --force to overwrite it",
+            path.display()
+        );
     }
     ensure_parent(path)?;
-    std::fs::write(path, STARTER).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
-const STARTER: &str = r#"# steer config. Built-in rules are active without this file; everything here
+pub const STARTER: &str = r#"# steer config. Built-in rules are active without this file; everything here
 # adds to them or switches them off.
 
 # Turn off a built-in by name. A repo with no fff index wants this one:
@@ -659,7 +768,7 @@ const STARTER: &str = r#"# steer config. Built-in rules are active without this 
 
 # [[rules]]
 # name = "jq-over-python-json"
-# tool = "Bash"
+# tool = "shell"
 # fires = ["python3 -c 'json.loads(open(\"a.json\").read())'"]
 # ignores = ["jq .name a.json"]
 #

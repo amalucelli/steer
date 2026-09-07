@@ -1,7 +1,7 @@
 // The payload projected into the document predicates read.
 //
-// One vocabulary matches every tool. A rule addresses `file_path` on an Edit
-// payload and `parsed.segments[].head` on a Bash one through the same path
+// One vocabulary matches every tool. A rule addresses `path` on an edit
+// payload and `parsed.segments[].head` on a shell one through the same path
 // syntax, because shell awareness is a pre-processing step that hangs a
 // `parsed` object off the payload rather than a second config dialect.
 
@@ -12,15 +12,15 @@ use std::path::{Component, Path, PathBuf};
 /// The lexed command and the document the predicates read, which every entry
 /// point into the engine needs before it can ask a rule anything. The segments
 /// come back alongside it so that one shell parse serves both matching and the
-/// spans a rewrite splices with. Only Bash carries a command line; every other
-/// tool is matched on its input alone.
+/// spans a rewrite splices with. Only the shell tool carries a command line;
+/// every other tool is matched on its input alone.
 pub(super) fn document(
     tool_name: &str,
     tool_input: &Value,
     cwd: Option<&Path>,
 ) -> (Vec<Segment>, Value) {
     let segments = match tool_name {
-        "Bash" => shell::lex(
+        "shell" => shell::lex(
             tool_input
                 .get("command")
                 .and_then(Value::as_str)

@@ -15,6 +15,7 @@
 use super::document::document;
 use super::rewrite::splice;
 use super::spec::{Action, Predicate, RuleSpec};
+use crate::harness;
 use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
@@ -87,6 +88,55 @@ fn build_globs(patterns: &[String], rule: &str, path: &str) -> Result<GlobSet> {
     builder.build().map_err(Into::into)
 }
 
+/// A message names a tool by writing a token, and a token renders only where
+/// the harness has that tool — so a rule writing one has to require it. Without
+/// that, a rule writing `{read}` denies a shell command by recommending one
+/// wherever the harness has no read tool, and nothing says so.
+///
+/// Ordered narrowest first, so a typo in `requires` reports as a typo rather
+/// than as the rule it leaves reaching nothing.
+fn gates(spec: &RuleSpec) -> Result<()> {
+    let name = &spec.name;
+    if let Some(tool) = spec
+        .requires
+        .iter()
+        .find(|tool| !harness::TOOLS.contains(&tool.as_str()))
+    {
+        bail!(
+            "rule `{name}`: `requires` names `{tool}`, which is not a tool; the tools are {}",
+            harness::TOOLS.join(", ")
+        );
+    }
+    // Two gates on one rule can disagree, and a reader has no way to tell which
+    // won.
+    if spec.agents.is_some() && spec.action.message().gates() {
+        bail!(
+            "rule `{name}`: a per-harness message already gates this rule; drop `agents`, or add a `default` message so the table is copy rather than a gate"
+        );
+    }
+    let texts = spec.action.message().texts();
+    for tool in harness::TOOLS {
+        let token = format!("{{{tool}}}");
+        let written = texts.iter().any(|text| text.contains(&token));
+        if !written || spec.requires.iter().any(|required| required == tool) {
+            continue;
+        }
+        let Some(without) = harness::all().find(|h| h.vocabulary.name(tool).is_none()) else {
+            continue;
+        };
+        bail!(
+            "rule `{name}`: its message writes `{token}` and {} has no {tool} tool; add `requires = [\"{tool}\"]` so the rule does not reach a harness it cannot name one for",
+            without.agent.as_str()
+        );
+    }
+    if harness::all().all(|h| spec.dropped_for(h.agent).is_some()) {
+        bail!(
+            "rule `{name}`: its gates reach no harness at all; `agents`, `requires` and the message table have to leave one standing"
+        );
+    }
+    Ok(())
+}
+
 impl Rule {
     pub fn compile(spec: RuleSpec) -> Result<Rule> {
         if spec.name.trim().is_empty() {
@@ -95,14 +145,7 @@ impl Rule {
         if spec.blocks.is_empty() {
             bail!("rule `{}` has no [[rules.match]] block", spec.name);
         }
-        // Two gates on one rule can disagree, and a reader has no way to tell
-        // which won.
-        if spec.agents.is_some() && spec.action.message().is_per_agent() {
-            bail!(
-                "rule `{}`: a per-harness message already gates this rule; drop `agents`",
-                spec.name
-            );
-        }
+        gates(&spec)?;
         if let Action::Rewrite {
             replace_head,
             drop_args,
@@ -202,7 +245,7 @@ impl Rule {
     /// nothing else in the stack takes part.
     pub fn fires_on(&self, command: &str, cwd: Option<&Path>) -> bool {
         let input = json!({ "command": command });
-        let (_, doc) = document("Bash", &input, cwd);
+        let (_, doc) = document("shell", &input, cwd);
         self.matches(&doc)
     }
 
@@ -220,7 +263,7 @@ impl Rule {
             return None;
         };
         let input = json!({ "command": command });
-        let (segments, doc) = document("Bash", &input, cwd);
+        let (segments, doc) = document("shell", &input, cwd);
         let hits = self.matching_segments(&doc);
         splice(
             command,
@@ -305,7 +348,7 @@ impl CompiledPredicate {
 }
 
 /// A string value contributes itself; an array contributes each of its string
-/// elements, so `args` and `file_path` read the same way.
+/// elements, so `args` and `path` read the same way.
 fn candidates(value: Option<&Value>) -> Vec<&str> {
     match value {
         Some(Value::String(s)) => vec![s.as_str()],
@@ -333,7 +376,7 @@ mod tests {
     const GREP: &str = r#"
 [[rules]]
 name = "t"
-tool = "Bash"
+tool = "shell"
 [[rules.match]]
 any = "parsed.segments"
 head = { any_of = ["grep"] }
@@ -363,16 +406,16 @@ message = "no"
     #[test]
     fn conditions_in_a_block_bind_to_one_element() {
         let r = rule(GREP);
-        assert!(r.matches(&doc("Bash", &bash("grep foo x"))));
+        assert!(r.matches(&doc("shell", &bash("grep foo x"))));
         // `gh` supplies the pipeline start and `grep` the head; neither segment
         // satisfies both, so the block must not hold.
-        assert!(!r.matches(&doc("Bash", &bash("gh pr list | grep foo"))));
+        assert!(!r.matches(&doc("shell", &bash("gh pr list | grep foo"))));
     }
 
     #[test]
     fn tool_gate_is_exact() {
         let r = rule(GREP);
-        assert!(!r.matches(&doc("Edit", &json!({ "file_path": "grep" }))));
+        assert!(!r.matches(&doc("edit", &json!({ "path": "grep" }))));
     }
 
     #[test]
@@ -382,14 +425,14 @@ message = "no"
 [[rules]]
 name = "t"
 [[rules.match]]
-file_path = { glob = ["*/secrets/*"] }
+path = { glob = ["*/secrets/*"] }
 [rules.action]
 kind = "context"
 message = "careful"
 "#,
         );
-        assert!(r.matches(&doc("Edit", &json!({"file_path": "a/secrets/b"}))));
-        assert!(!r.matches(&doc("Edit", &json!({"file_path": "a/b"}))));
+        assert!(r.matches(&doc("edit", &json!({"path": "a/secrets/b"}))));
+        assert!(!r.matches(&doc("edit", &json!({"path": "a/b"}))));
     }
 
     #[test]

@@ -29,7 +29,7 @@
 [[rules]]
 name = "no-sudo"
 description = "A machine-wide change is a decision with a different owner."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -65,7 +65,7 @@ ignores = ["apt install jq", "brew install jq", "cargo build"]
 [[rules]]
 name = "docker-prune-guard"
 description = "Docker volumes hold the state that cannot be rebuilt."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -126,7 +126,7 @@ ignores = ["docker compose down", "docker system prune -a", "docker ps -a", "doc
 [[rules]]
 name = "no-history-loss"
 description = "Discarding uncommitted work is the one thing git cannot undo."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -177,7 +177,7 @@ ignores = ["git reset HEAD~1", "git clean -n", "git checkout -b feature", "git r
 [[rules]]
 name = "kubectl-prod-guard"
 description = "Destructive kubectl verbs stop at anything named production."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -208,7 +208,7 @@ ignores = ["kubectl --context staging delete pod api-0", "kubectl get pods --con
 [[rules]]
 name = "terraform-no-auto-approve"
 description = "The plan is the review step; -auto-approve deletes it."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -247,7 +247,7 @@ ignores = ["terraform plan -out tf.plan", "terraform apply tf.plan", "terraform 
 [[rules]]
 name = "psql-prod-guard"
 description = "Database clients stop at production hosts and destructive statements."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"

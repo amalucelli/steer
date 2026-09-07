@@ -10,9 +10,9 @@
 # `no-pipe-to-shell` used to live here and is now a built-in, active with no
 # config at all.
 #
-# `webfetch-allowlist` matches Claude Code's tool names and never fires under
-# Codex. It also ships without `[rules.test]`: examples are Bash command lines,
-# so a rule gated on another tool cannot declare any.
+# `webfetch-allowlist` gates the fetch tool, which not every harness has. It
+# ships without `[rules.test]`: examples are shell command lines, and a rule
+# gated on another tool cannot declare any.
 
 
 # Turning off certificate verification is almost never the fix. It is what a
@@ -32,7 +32,7 @@
 [[rules]]
 name = "no-insecure-tls"
 description = "Certificate verification stays on."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -73,7 +73,7 @@ ignores = ["curl -sL https://x.test", "curl --key client.pem https://x.test", "w
 [[rules]]
 name = "no-untrusted-registry"
 description = "Packages come from the registry the project declares."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -110,7 +110,7 @@ ignores = ["npm install --registry=https://registry.npmjs.org", "npm install --r
 [[rules]]
 name = "webfetch-allowlist"
 description = "Fetches go to hosts the config names."
-tool = "WebFetch"
+tool = "fetch"
 
 [[rules.match]]
 url = { none_glob = ["https://docs.rs/*", "https://doc.rust-lang.org/*", "https://github.com/*", "https://raw.githubusercontent.com/*", "https://*.github.io/*"] }
@@ -141,7 +141,7 @@ vendored, look there first."""
 [[rules]]
 name = "unpinned-install"
 description = "An unpinned install takes whatever the registry serves today."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"

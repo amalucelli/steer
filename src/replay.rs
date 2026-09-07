@@ -39,10 +39,13 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// The command line, for Bash entries only. Every other tool is logged for
+    /// The command line, for shell entries only. Every other tool is logged for
     /// its decision, not for anything that can be re-lexed.
+    ///
+    /// Logs written before the vocabulary was neutral say `Bash`, and those are
+    /// the history a freshly renamed ruleset most needs replaying against.
     fn command(&self) -> Option<&str> {
-        if self.tool_name != "Bash" {
+        if self.tool_name != "shell" && self.tool_name != "Bash" {
             return None;
         }
         self.tool_input.get("command")?.as_str()
@@ -99,7 +102,7 @@ pub fn replay(entries: &[Entry], ruleset: &[Rule]) -> Vec<Change> {
         };
         let input = serde_json::json!({ "command": command });
         let cwd = entry.cwd.as_ref().map(PathBuf::from);
-        let decision = rules::evaluate(ruleset, "Bash", &input, cwd.as_deref(), None);
+        let decision = rules::evaluate(ruleset, "shell", &input, cwd.as_deref(), None);
         if decision.outcome.as_str() == entry.outcome {
             continue;
         }
@@ -139,7 +142,7 @@ pub struct Escape {
 /// and neither line says so alone.
 pub fn escapes(entries: &[Entry]) -> Vec<Escape> {
     // Lexed once rather than per candidate pair: a window used to hold about one
-    // entry, and now that every allowed Bash call is logged it holds tens, each
+    // entry, and now that every allowed shell call is logged it holds tens, each
     // of which would otherwise re-lex both sides.
     let lexed: Vec<Fingerprint> = entries
         .iter()
@@ -207,7 +210,7 @@ pub fn escapes(entries: &[Entry]) -> Vec<Escape> {
 pub fn closed(escape: &Escape, ruleset: &[Rule]) -> bool {
     let input = serde_json::json!({ "command": escape.allowed });
     let cwd = cwd(escape);
-    rules::evaluate(ruleset, "Bash", &input, cwd.as_deref(), None).outcome != Outcome::Allow
+    rules::evaluate(ruleset, "shell", &input, cwd.as_deref(), None).outcome != Outcome::Allow
 }
 
 /// Where the call ran, since `in_workspace` means nothing against any other
@@ -388,7 +391,7 @@ fn relaxed(spec: &RuleSpec, escape: &Escape, element: usize) -> Option<MatchBloc
     let rule = Rule::compile(spec.clone()).ok()?;
     let input = serde_json::json!({ "command": escape.allowed });
     let cwd = escape.cwd.as_deref().map(Path::new);
-    let trace = rules::trace_at(&[rule], "Bash", &input, cwd, Some(element))
+    let trace = rules::trace_at(&[rule], "shell", &input, cwd, Some(element))
         .into_iter()
         .next()?;
     let mut block = spec.blocks.get(trace.block)?.clone();
@@ -456,8 +459,9 @@ pub fn draft_rule(shape: &Shape) -> Draft {
         spec: RuleSpec {
             name: format!("tool-over-{}", shape.head),
             description: String::new(),
-            tool: Some("Bash".into()),
+            tool: Some("shell".into()),
             agents: None,
+            requires: Vec::new(),
             blocks: vec![segment_block(&shape.head, true)],
             action: Action::Deny {
                 message: Message::default(),
@@ -715,11 +719,18 @@ mod tests {
             ts_ms: ts_s * 1000,
             outcome: outcome.into(),
             rules: Vec::new(),
-            tool_name: "Bash".into(),
+            tool_name: "shell".into(),
             tool_input: serde_json::json!({ "command": command }),
             session_id: Some(session.into()),
             cwd: None,
         }
+    }
+
+    #[test]
+    fn an_entry_from_before_the_rename_still_carries_its_command() {
+        let mut legacy = entry(100, "allow", "s1", "rg -n foo src");
+        legacy.tool_name = "Bash".into();
+        assert_eq!(legacy.command(), Some("rg -n foo src"));
     }
 
     // The documented escape in `edit-over-python`: `-c` is legal so a model

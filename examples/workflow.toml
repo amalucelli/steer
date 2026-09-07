@@ -11,9 +11,9 @@
 # most personal file here — `no-staging` in particular is a house rule, not a
 # widely held one.
 #
-# `lockfile-is-generated` matches Claude Code's tool names and never fires
-# under Codex. It also ships without `[rules.test]`: examples are Bash command
-# lines, so a rule gated on another tool cannot declare any.
+# `lockfile-is-generated` matches file tools rather than the shell, so it ships
+# without `[rules.test]`: examples are shell command lines, and a rule gated on
+# another tool cannot declare any.
 
 
 # A scope control rather than a security one. An agent that wanders into a
@@ -31,7 +31,7 @@
 [[rules]]
 name = "stay-in-workspace"
 description = "Reads and writes stay inside the session's working tree."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -66,7 +66,7 @@ ignores = ["cargo build", "git status", "ls src", "brew install jq"]
 [[rules]]
 name = "no-staging"
 description = "What goes in a commit is the user's call."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -90,15 +90,15 @@ ignores = ["git status", "git diff", "git rm --cached .env", "git restore --stag
 # next install rewrites it, and in the meantime CI and the local tree disagree
 # about what is installed for reasons nobody can see in the diff.
 #
-# Only Edit and Write are matched. The package manager rewrites these files
-# constantly and does it through its own process, which steer never sees.
+# The package manager rewrites these files constantly and does it through its
+# own process, which steer never sees.
 [[rules]]
 name = "lockfile-is-generated"
 description = "Lockfiles are output; editing one desynchronises it from the manifest."
 
 [[rules.match]]
-tool_name = { any_of = ["Edit", "Write", "NotebookEdit"] }
-file_path = { glob = ["*Cargo.lock", "*package-lock.json", "*pnpm-lock.yaml", "*yarn.lock", "*go.sum", "*poetry.lock", "*uv.lock", "*Gemfile.lock", "*composer.lock"] }
+tool_name = { any_of = ["edit", "write", "NotebookEdit"] }
+path = { glob = ["*Cargo.lock", "*package-lock.json", "*pnpm-lock.yaml", "*yarn.lock", "*go.sum", "*poetry.lock", "*uv.lock", "*Gemfile.lock", "*composer.lock"] }
 
 [rules.action]
 kind = "deny"
@@ -121,7 +121,7 @@ Change the manifest and let the tool resolve: `cargo add`, `npm install`, \
 [[rules]]
 name = "no-background-servers"
 description = "A server started in a tool call is never stopped."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -169,7 +169,7 @@ ignores = ["npm run build", "npm test", "cargo build", "python3 scripts/gen.py"]
 [[rules]]
 name = "commit-no-verify"
 description = "Pre-commit hooks are the checks the repo asked for."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -208,7 +208,7 @@ ignores = ["git commit -m fix", "git push -n", "git push origin main"]
 [[rules]]
 name = "no-git-config-global"
 description = "Machine-wide git settings outlive the task that wanted them."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"
@@ -242,7 +242,7 @@ ignores = ["git config --global --list", "git config user.email me@example.com",
 [[rules]]
 name = "targeted-tests"
 description = "A whole-suite run is rarely the question being asked."
-tool = "Bash"
+tool = "shell"
 
 [[rules.match]]
 any = "parsed.segments"

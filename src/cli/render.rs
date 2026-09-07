@@ -6,7 +6,8 @@
 // two lines of this output, not two data structures.
 
 use super::ink::{paint_outcome, row, Ink};
-use crate::rules;
+use crate::{harness, rules};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The rule's contract on one line: what it does, and what it is allowed to see.
@@ -20,15 +21,65 @@ pub fn headline(spec: &rules::RuleSpec, ink: &Ink) -> String {
         action => paint_outcome(ink, action.outcome()),
     };
     let tool = spec.tool.clone().unwrap_or_else(|| "any tool".into());
-    let agents = match spec.gated_to() {
-        Some(list) => list
-            .iter()
-            .map(|a| a.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-        None => "any agent".into(),
-    };
-    format!("{action} {}", ink.dim(&format!("· {tool} · {agents}")))
+    format!(
+        "{action} {} {}",
+        ink.dim(&format!("· {tool} ·")),
+        audience(spec, ink)
+    )
+}
+
+/// Every harness against this rule: the ones it reaches, the ones a missing
+/// capability degrades it for, and the ones it never reaches with the reason.
+///
+/// Grouped by verdict rather than one entry per harness, and a group too long
+/// to take in at a glance is counted rather than spelled. The line is read for
+/// which rules are unusual; with sixteen harnesses a roll call of the ordinary
+/// ones buries that.
+fn audience(spec: &rules::RuleSpec, ink: &Ink) -> String {
+    let mut applies = Vec::new();
+    let mut degraded = Vec::new();
+    let mut dropped: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    let rewrite = matches!(spec.action, rules::Action::Rewrite { .. });
+    for harness in harness::all() {
+        let name = harness.agent.as_str();
+        match spec.dropped_for(harness.agent) {
+            Some(why) => dropped.entry(why).or_default().push(name),
+            None if rewrite && !harness.capabilities.rewrite => degraded.push(name),
+            None => applies.push(name),
+        }
+    }
+    if applies.len() == harness::all().count() {
+        return ink.dim("any agent");
+    }
+
+    let mut parts = Vec::new();
+    if !applies.is_empty() {
+        parts.push(ink.dim(&match spell(&applies) {
+            Some(names) => names,
+            None => format!("{} agents", applies.len()),
+        }));
+    }
+    if !degraded.is_empty() {
+        parts.push(ink.yellow(&match spell(&degraded) {
+            Some(names) => format!("{names}: deny carrying the command"),
+            None => format!("{} as a deny carrying the command", degraded.len()),
+        }));
+    }
+    for (why, names) in dropped {
+        parts.push(ink.dim(&match spell(&names) {
+            Some(names) => format!("{names}: dropped, {why}"),
+            None => format!("{} dropped, {why}", names.len()),
+        }));
+    }
+    parts.join(&ink.dim(" · "))
+}
+
+/// The group written out, or `None` where it is long enough that the count is
+/// what the reader is actually after. Five, so the harnesses that take no
+/// edited tool input — the one group a rewrite is always weighed against — stay
+/// named.
+fn spell(names: &[&str]) -> Option<String> {
+    (names.len() <= 5).then(|| names.join(", "))
 }
 
 pub fn print_rule(spec: &rules::RuleSpec, cwd: &Path, ink: &Ink) {
