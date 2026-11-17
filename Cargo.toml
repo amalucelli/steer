@@ -1,6 +1,6 @@
 [package]
 name = "steer"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "A coding-agent hook that steers tool calls toward the right tool — a configurable rule engine over shell-aware payloads."
 authors = ["Alexandre Malucelli <alexandre@malucelli.net>"]
